@@ -26,9 +26,11 @@ def engine(baseline_dir):
 
 def test_every_seed_edge_passes_on_clean_data(engine):
     graph = MetricGraph.load(DEFAULT_GRAPH)
+    expected = len({(e.to_metric, e.key) for e in graph.edges() if e.type in ("formula", "breakdown")})
+    assert expected >= 23
     report = run_checks(engine, graph)
     assert report.unknown_metrics == []
-    assert report.counts == {"pass": 23, "fail": 0, "skipped": 0}
+    assert report.counts == {"pass": expected, "fail": 0, "skipped": 0}
     assert all(e.status == "confirmed" for e in graph.edges() if e.type in ("formula", "breakdown"))
     assert all(e.status == "uncertain" for e in graph.edges("possible_cause"))
 
@@ -58,6 +60,18 @@ def test_weight_metric_is_derived_from_the_denominator():
     assert weight_metric_for("avg_active_listings", reg) is None
     defs = checker_metric_defs(reg)
     assert "weight_metric" not in defs["orders"]
+    assert defs["orders"]["is_additive"] and defs["revenue"]["is_additive"]
+    # currency / count units that must not be summed across slices
+    assert not defs["average_order_value"]["is_additive"]
+    assert not defs["avg_active_listings"]["is_additive"]
+
+
+def test_non_additive_currency_metric_breakdown_is_weighted(engine):
+    """average_order_value has unit currency_eur but must be weighted by orders, not summed."""
+    graph = MetricGraph()
+    graph.add_edge(GraphEdge("average_order_value", "average_order_value", "breakdown", dimension="country"))
+    (res,) = run_checks(engine, graph).results.values()
+    assert res.outcome == "pass", res.detail
 
 
 def test_compute_fn_has_the_checker_signature(engine):
@@ -73,6 +87,6 @@ def test_cli(baseline_dir, tmp_path, capsys):
     saved = tmp_path / "checked.yaml"
     assert main(["--data", str(baseline_dir), "--save", str(saved)]) == 0
     out = capsys.readouterr().out
-    assert "23 passed, 0 failed" in out and "payment_success_rate [confirmed]" in out
+    assert " passed, 0 failed, 0 skipped" in out and "payment_success_rate [confirmed]" in out
     assert all(e.status == "confirmed" for e in MetricGraph.load(saved).edges("formula"))
     assert main(["--data", str(tmp_path / "missing")]) == 2
