@@ -172,6 +172,38 @@ def test_ambiguous_formulas_downgraded_with_suggested_checks() -> None:
     assert all(len(r.suggested_checks) >= 1 for r in resolved)
 
 
+def test_ranked_ambiguity_keeps_top_candidate_confirmed() -> None:
+    df = _make_synthetic_df()
+    compute = _make_compute(df)
+    mg = _make_base_graph()
+
+    c_top = Candidate(
+        new_metric="order_rate",
+        type="formula",
+        from_metric="orders",
+        to_metric="order_rate",
+        formula="order_rate = orders / sessions",
+        source="auto_discovered",
+        rationale="rank=1; exact metric definition",
+    )
+    c_alt = Candidate(
+        new_metric="order_rate",
+        type="formula",
+        from_metric="orders",
+        to_metric="order_rate",
+        formula="order_rate = orders / (sessions * 1.003)",
+        source="auto_discovered",
+        rationale="rank=2; secondary fit",
+    )
+    r_top = validate_candidate(c_top, mg, compute, "2026-10-01T00:00:00Z", "2026-10-01T23:00:00Z")
+    r_alt = validate_candidate(c_alt, mg, compute, "2026-10-01T00:00:00Z", "2026-10-01T23:00:00Z")
+    resolved = resolve_ambiguity([r_top, r_alt])
+
+    assert resolved[0].status == "confirmed"
+    assert resolved[1].status == "uncertain"
+    assert resolved[1].confidence <= 0.6
+
+
 def test_per_slice_failure_noted_on_confirmed_formula() -> None:
     df = _make_synthetic_df()
     compute = _make_compute(df)

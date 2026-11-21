@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Literal, Protocol
 
@@ -320,6 +321,15 @@ def validate_candidate(
     return _validate_possible_cause(candidate, edge, compute, start, end)
 
 
+_RANK_RE = re.compile(r"(?:\brank\s*[:=]\s*|#)(\d+)\b", re.IGNORECASE)
+
+
+def _extract_rank(rationale: str) -> int | None:
+    """Extract numeric rank (1 = best) from candidate rationale if present."""
+    match = _RANK_RE.search(rationale or "")
+    return int(match.group(1)) if match else None
+
+
 def _resolve_ambiguity_internal(
     results: list[ValidationResult],
 ) -> tuple[list[ValidationResult], list[list[str]], list[str]]:
@@ -334,6 +344,28 @@ def _resolve_ambiguity_internal(
     for target, group in by_target.items():
         if len(group) < 2:
             continue
+
+        ranks = [_extract_rank(r.candidate.rationale) for r in group]
+        ranked_only = [rk for rk in ranks if rk is not None]
+        best_rank = min(ranked_only) if ranked_only else None
+        winners = (
+            [r for r, rk in zip(group, ranks) if rk == best_rank]
+            if best_rank is not None
+            else []
+        )
+
+        # If a single top-ranked candidate stands out (e.g. rank=1 vs rank=2+),
+        # keep it confirmed and only mark the lower-ranked alternatives uncertain.
+        if len(winners) == 1:
+            winner = winners[0]
+            winner.evidence = f"{winner.evidence}; top-ranked (rank={best_rank})"
+            others = [r for r in group if r is not winner]
+            for res in others:
+                res.status = "uncertain"
+                res.confidence = min(res.confidence, 0.6)
+                res.evidence = f"{res.evidence}; ambiguous: also fits {winner.candidate.formula}"
+            continue
+
         formulas = [r.candidate.formula or "" for r in group]
         ambiguous_groups.append(formulas)
         checks = [
