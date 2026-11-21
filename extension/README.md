@@ -17,6 +17,31 @@ report.best_formula()           # top Candidate or None
 report.edges()                  # GraphEdge list: status "uncertain", source "auto_discovered"
 ```
 
+## The full step: discover, validate, add
+
+`add_new_metric` ([pipeline.py](pipeline.py)) joins discovery (Person A) to
+Person B's validation and extension (`graph/extend.py`). It runs these steps:
+
+1. check the definition on the data
+2. discover candidates
+3. register the metric
+4. make every registered metric known to the graph
+5. convert the candidates to `graph.extend.Candidate`
+6. run `extend_graph` with the real engine, passing `is_additive` and
+   `weight_metric` so breakdowns of rate metrics get checked
+
+If anything fails, the registry is rolled back.
+
+```bash
+python -m extension --metric extension/examples/new_metrics.yaml --apply \
+    --save-graph data/generated/graph_extended.yaml --save-metrics data/generated/metrics_extended.yaml
+python -m graph --data data/generated/scenarios \
+    --graph data/generated/graph_extended.yaml --metrics data/generated/metrics_extended.yaml
+```
+
+With the four example metrics, the extended graph passes all 44 formula and
+breakdown checks (26 seed + 18 new).
+
 ## How it finds connections
 
 | Step | What it does | Output |
