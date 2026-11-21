@@ -19,4 +19,5 @@ Built for the Almedia track "Eye of the System: Fully Agentic Monitoring".
 
 ## Status
 
-Design phase: no implementation yet.
+- L1 baseline generator: done ([simulator/README.md](simulator/README.md)).
+- Everything else: not started.
