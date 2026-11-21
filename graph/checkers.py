@@ -32,7 +32,7 @@ def _relative_error(expected: np.ndarray, actual: np.ndarray) -> np.ndarray:
     """Compute element-wise relative error, handling exact zeros cleanly."""
     diff = np.abs(actual - expected)
     denom = np.abs(expected)
-    return np.where(denom > 0, diff / denom, diff)
+    return np.divide(diff, denom, out=diff.copy(), where=denom > 0)
 
 
 def check_formula(
