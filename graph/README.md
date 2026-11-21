@@ -1,4 +1,30 @@
-# L2 Metric graph: registry + calculation engine
+# L2 Metric graph
+
+## Running it
+
+```bash
+pip install -r requirements.txt
+python -m simulator                 # writes clean data to data/generated/baseline
+python -m graph                     # checks every formula and breakdown edge, prints the tree
+python -m graph --data data/generated/scenarios --save data/generated/graph_checked.yaml
+python -m pytest
+```
+
+`python -m graph` loads [metrics.yaml](metrics.yaml) and
+[seed_graph.yaml](seed_graph.yaml), validates every metric on the data, checks
+every formula and breakdown edge with the real engine, and prints the results
+and the metric tree. It exits with code 0 only if every edge passes. `--save`
+writes the graph with the updated edge statuses.
+
+How the two halves fit:
+
+- **Person A:** `registry.py`, `engine.py`, `metrics.yaml`
+- **Person B:** `edges.py`, `metric_graph.py`, `formulas.py`, `checkers.py`, `tree.py`, `seed_graph.yaml`
+- **Bridge:** `bridge.py` adapts the engine to the checkers' `compute(metric, start, end, group_by)`
+  signature. It also derives the `weight_metric` for a ratio breakdown from the
+  calculation's denominator (for example `payment_success_rate` gets `payment_attempts`).
+
+## Registry + calculation engine
 
 The registry holds metric definitions in the contract format
 (`contracts/contracts.md` section 2; seed list in [metrics.yaml](metrics.yaml)).

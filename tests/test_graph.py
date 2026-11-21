@@ -89,6 +89,7 @@ def _make_compute(df: pd.DataFrame):
             "checkout_rate": ("checkouts", "cart_adds"),
             "search_ctr": ("search_clicks", "searches"),
             "aov": ("revenue", "orders"),
+            "average_order_value": ("revenue", "orders"),  # name used in graph/metrics.yaml
             "refund_rate": ("refunds", "orders"),
             "ad_ctr": ("ad_clicks", "ad_impressions"),
             "cost_per_click": ("ad_spend", "ad_clicks"),
