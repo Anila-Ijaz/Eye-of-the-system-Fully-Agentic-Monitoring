@@ -5,8 +5,26 @@ Generates normal marketplace data (no faults, no events) in the
 
 ```bash
 pip install -r requirements.txt
-python -m simulator --days 28 --start 2026-10-01 --seed 42 --out data/generated/baseline
-python -m pytest tests/test_generator.py
+python -m simulator                       # clean baseline -> data/generated/baseline
+python -m simulator --scenarios all       # + faults and innocent changes -> data/generated/scenarios
+python -m simulator --scenarios faults --days 35 --anchor 2026-10-29T10:00:00Z --out data/generated/demo
+python -m pytest
+```
+
+`--scenarios` takes `none`, `faults`, `innocent` or `all`. By default the
+suites start at 10:00 UTC on the first day of the last week, so there is at
+least a week of normal history before them. Stock-outs are produced through
+late supplier deliveries (`InventoryHooks`), so `purchase_orders.csv` and
+`inventory_daily.csv` hold the evidence. `ground_truth.json` is written next
+to the data. Only tests and L7 scoring may read it; L4 to L6 must not.
+
+From Python (for example the L7 demo script):
+
+```python
+from simulator import SimConfig
+from simulator.pipeline import build_dataset
+
+result, truth = build_dataset(SimConfig(days=35), scenarios="all", out_dir="data/generated/demo")
 ```
 
 28 days take about 5 seconds and give 32,256 rows
