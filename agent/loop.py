@@ -443,7 +443,12 @@ def _execute_item(
         else:
             h.timing_aligned = True
             h.segment = dict(args["segment"])
-            target_share = state.tree.get(target, {}).get("share", 1.0 if target == anomaly_metric else 0.0)
+            feeds = any(e.from_metric == anomaly_metric and e.to_metric == target for e in graph.edges("formula"))
+            target_share = state.tree.get(target, {}).get("share", 1.0 if target == anomaly_metric or feeds else 0.0)
+            if feeds:  # the anomaly metric is then a symptom of this upstream cause
+                for x in hyps:
+                    if x.node == anomaly_metric and x.source in ("segment", "formula_component"):
+                        x.is_symptom = True
             h.explained_share = max(h.explained_share, target_share)
             h.localized = h.localized or any(x.localized and x.segment == h.segment for x in hyps if x is not h)
             h.evidence.append({"type": "upstream_check", **res})

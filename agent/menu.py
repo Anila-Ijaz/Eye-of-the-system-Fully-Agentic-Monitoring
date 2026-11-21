@@ -145,6 +145,11 @@ def build_menu(
         targets = [(metric, 1.0)] + [
             (m, float(n.get("share", 0.0))) for m, n in state.tree.items() if float(n.get("share", 0.0)) >= 0.2
         ]
+        # a leaf rate (add_to_cart_rate) also inherits the possible causes of what it feeds
+        # into (out_of_stock_rate -> cart_adds, where cart_adds = product_clicks * add_to_cart_rate)
+        for e in graph.edges("formula"):
+            if e.from_metric == metric and e.to_metric != metric and (e.to_metric, 1.0) not in targets:
+                targets.append((e.to_metric, 1.0))
         seg_of = {str(h["node"]): dict(h.get("segment") or segment) for h in state.hypotheses
                   if h.get("source") == "formula_component" and h.get("localized")}
         for target, weight in targets:

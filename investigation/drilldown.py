@@ -16,9 +16,10 @@ contribution to the total change is:
   are averages of baseline and actual. The two parts add up exactly to dR.
 
 The dimension where one value carries the largest share of the change is
-chosen. If that share is at least ``min_share``, the drill continues inside
-that value; otherwise it stops, because the change is spread across the
-dimension. It also stops when no dimension is left.
+chosen. If that share is at least ``min_share``, and the rest of the segment
+moved by less than ``max_rest_ratio`` times as much as that value, the drill
+continues inside that value. Otherwise it stops, because the change is spread
+across the dimension. It also stops when no dimension is left.
 """
 
 from __future__ import annotations
@@ -131,6 +132,7 @@ def drill_down(
     weeks: int = DEFAULT_WEEKS,
     min_share: float = 0.5,
     min_lead: float = 0.0,
+    max_rest_ratio: float = 0.5,
 ) -> DrillResult:
     """Narrow the change down to the segment that explains most of it."""
     defn = engine.registry.get(metric)
@@ -149,8 +151,13 @@ def drill_down(
             if t.empty or not np.isfinite(t["share"]).any():
                 continue
             top = t.iloc[0]
-            # a single value only "explains" if it moves the same way as the total
+            # a single value only "explains" if it moves the same way as the total ...
             if top["share"] <= 0:
+                continue
+            # ... and the rest did not move nearly as much: android -100% while web and
+            # ios are also -100% is a change across platforms, not an android problem
+            rel, rest = abs(float(top["rel_change"])), float(top["others_rel_change"])
+            if np.isfinite(rest) and np.isfinite(rel) and abs(rest) > max_rest_ratio * rel:
                 continue
             if best is None or top["share"] > best["share"]:
                 best_dim, best = d, top
