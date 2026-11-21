@@ -96,6 +96,8 @@ def _make_compute(df: pd.DataFrame):
             "searches_per_session": ("searches", "sessions"),
             "search_ctr": ("search_clicks", "searches"),
             "average_order_value": ("revenue", "orders"),
+            "aov": ("revenue", "orders"),
+            "average_order_value": ("revenue", "orders"),  # name used in graph/metrics.yaml
             "refund_rate": ("refunds", "orders"),
             "ad_ctr": ("ad_clicks", "ad_impressions"),
             "cost_per_click": ("ad_spend", "ad_clicks"),

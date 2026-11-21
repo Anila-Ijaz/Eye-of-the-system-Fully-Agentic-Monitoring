@@ -1,25 +1,25 @@
-"""L2 metric graph: registry, calculation engine, relationships, checkers, and tree view."""
+"""L2 metric graph.
 
-from __future__ import annotations
+Person A: metric registry and calculation engine (registry.py, engine.py).
+Person B: typed edges, metric graph, formula/breakdown checkers, tree view
+(edges.py, metric_graph.py, formulas.py, checkers.py, tree.py).
+bridge.py connects the two.
+"""
 
-from graph.checkers import CheckResult, check_breakdown, check_formula, check_graph
-from graph.edges import GraphEdge
-from graph.formulas import eval_formula, parse_formula
-from graph.metric_graph import MetricGraph
-from graph.registry import (
+from .bridge import checker_metric_defs, engine_compute_fn, run_checks
+from .checkers import CheckResult, check_breakdown, check_formula, check_graph
+from .edges import GraphEdge
+from .engine import MetricEngine, ValidationReport
+from .formulas import eval_formula, parse_formula
+from .metric_graph import MetricGraph
+from .registry import (
     ALLOWED_UNITS,
     DEFAULT_METRICS_FILE,
     MetricDefinition,
     MetricDefinitionError,
     MetricRegistry,
 )
-from graph.tree import build_tree, render_text
-
-try:
-    from graph.engine import MetricEngine, ValidationReport
-except ImportError:  # duckdb optional when only using graph/checkers with a custom compute()
-    MetricEngine = None  # type: ignore[assignment,misc]
-    ValidationReport = None  # type: ignore[assignment,misc]
+from .tree import build_tree, render_text
 
 __all__ = [
     "ALLOWED_UNITS",
@@ -36,7 +36,10 @@ __all__ = [
     "check_breakdown",
     "check_formula",
     "check_graph",
+    "checker_metric_defs",
+    "engine_compute_fn",
     "eval_formula",
     "parse_formula",
     "render_text",
+    "run_checks",
 ]
