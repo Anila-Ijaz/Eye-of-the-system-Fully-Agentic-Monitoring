@@ -52,11 +52,12 @@ def weight_metric_for(metric: str, registry: MetricRegistry) -> Optional[str]:
 
 
 def checker_metric_defs(registry: MetricRegistry) -> dict[str, dict[str, Any]]:
-    """Metric definitions as plain dicts for the checkers, plus ``weight_metric``
-    for non-additive metrics where it can be derived from the calculation."""
+    """Metric definitions as plain dicts for the checkers, plus ``is_additive``
+    and, for non-additive metrics, a ``weight_metric`` derived from the calculation."""
     defs = {}
     for m in registry:
         d = m.to_dict()
+        d["is_additive"] = m.is_additive
         if not m.is_additive:
             w = weight_metric_for(m.name, registry)
             if w:
