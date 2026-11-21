@@ -512,7 +512,7 @@ def default_fault_scenarios(anchor_time: pd.Timestamp | str) -> list[ScenarioSpe
             root_cause="inventory_stock_out",
             description="Supplier delivery delay caused stock-outs in electronics",
             start_time=t0 + pd.Timedelta(days=2),
-            end_time=t0 + pd.Timedelta(days=2, hours=20),
+            end_time=t0 + pd.Timedelta(days=6, hours=13),
             affected_segment={"category": "electronics"},
             primary_metric="out_of_stock_rate",
             downstream_metrics=["cart_adds", "orders", "revenue"],
