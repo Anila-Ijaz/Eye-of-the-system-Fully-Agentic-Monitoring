@@ -1,8 +1,10 @@
 """Scenario injector for L1 marketplace simulator.
 
 Applies fault scenarios and innocent changes to a baseline ``marketplace_hourly``
-DataFrame, and produces the corresponding ``events`` table and ``ground_truth.json``
-artifact defined in ``contracts/contracts.md``.
+DataFrame, produces the corresponding ``events`` table and ``ground_truth.json``
+artifact defined in ``contracts/contracts.md``, and provides ``InventoryHooks``
+builders so stock-out faults leave real supply-chain evidence in
+``inventory_daily`` and ``purchase_orders``.
 """
 
 from __future__ import annotations
@@ -14,11 +16,20 @@ from typing import Any, Callable, Literal
 
 import pandas as pd
 
-MARKETPLACE_COLUMNS: tuple[str, ...] = (
-    "timestamp",
-    "country",
-    "platform",
-    "category",
+from simulator.catalog import InventoryHooks
+from simulator.config import SimConfig
+from simulator.schema import (
+    EVENTS_COLUMNS,
+    MARKETPLACE_HOURLY_COLUMN_NAMES,
+    TIMESTAMP_FORMAT,
+)
+
+# Re-export as tuples for backwards compatibility with callers/tests.
+MARKETPLACE_COLUMNS: tuple[str, ...] = tuple(MARKETPLACE_HOURLY_COLUMN_NAMES)
+
+_DEFAULT_UTC_OFFSETS: dict[str, int] = SimConfig().utc_offset_hours
+
+_ALL_TRAFFIC_INT_COLS: list[str] = [
     "sessions",
     "searches",
     "search_clicks",
@@ -29,26 +40,23 @@ MARKETPLACE_COLUMNS: tuple[str, ...] = (
     "payment_attempts",
     "orders",
     "refunds",
-    "revenue",
     "ad_impressions",
     "ad_clicks",
-    "ad_spend",
-    "active_listings",
-    "out_of_stock_views",
-)
+]
+_ALL_TRAFFIC_FLOAT_COLS: list[str] = ["revenue", "ad_spend"]
 
-EVENTS_COLUMNS: tuple[str, ...] = (
-    "event_id",
-    "start_time",
-    "end_time",
-    "event_type",
-    "planned",
-    "country",
-    "platform",
-    "category",
-    "description",
-    "expected_effect",
-)
+_FUNNEL_INT_COLS: list[str] = [
+    "sessions",
+    "searches",
+    "search_clicks",
+    "recommendation_impressions",
+    "recommendation_clicks",
+    "cart_adds",
+    "checkouts",
+    "payment_attempts",
+    "orders",
+    "refunds",
+]
 
 
 @dataclass(frozen=True)
@@ -79,6 +87,10 @@ def _ensure_utc(ts: pd.Timestamp | str) -> pd.Timestamp:
     return parsed.tz_convert("UTC")
 
 
+def _format_utc_z(ts: pd.Timestamp) -> str:
+    return _ensure_utc(ts).strftime(TIMESTAMP_FORMAT)
+
+
 def _segment_mask(
     df: pd.DataFrame,
     start_time: pd.Timestamp,
@@ -106,6 +118,19 @@ def _scale_float_columns(
 ) -> None:
     for col in columns:
         df.loc[mask, col] = (df.loc[mask, col] * factor).clip(lower=0.0).round(2)
+
+
+def _scale_funnel_by_series(
+    df: pd.DataFrame, mask: pd.Series, ratio: pd.Series
+) -> None:
+    """Scale session-driven funnel columns row-wise by ``ratio``."""
+    for col in _FUNNEL_INT_COLS:
+        df.loc[mask, col] = (
+            (df.loc[mask, col].astype(float) * ratio).round().clip(lower=0).astype(int)
+        )
+    df.loc[mask, "revenue"] = (
+        (df.loc[mask, "revenue"].astype(float) * ratio).clip(lower=0.0).round(2)
+    )
 
 
 def _enforce_funnel_bounds(df: pd.DataFrame, mask: pd.Series) -> None:
@@ -148,14 +173,18 @@ def _apply_bad_search_release(
 def _apply_stock_out(
     df: pd.DataFrame, mask: pd.Series, spec: ScenarioSpec
 ) -> pd.DataFrame:
-    """Increase out-of-stock views, reduce active listings, and depress conversions."""
+    """Fallback DataFrame edit when stock-out was not generated via InventoryHooks.
+
+    When running with ``generator.generate(..., inventory_hooks=build_inventory_hooks(...))``,
+    pass ``apply_stock_out_to_df=False`` to ``inject_scenarios`` so the supply-chain
+    simulation itself drives the hourly counts.
+    """
     listing_drop = float(spec.params.get("listing_drop_rate", 0.40))
     oos_multiplier = float(spec.params.get("oos_multiplier", 4.0))
     conversion_drop = float(spec.params.get("conversion_drop_rate", 0.45))
 
     _scale_int_columns(df, mask, ["active_listings"], max(0.0, 1.0 - listing_drop))
     _scale_int_columns(df, mask, ["out_of_stock_views"], oos_multiplier)
-    # Ensure out-of-stock views visibly spike even if baseline was 0.
     zero_oos = mask & (df["out_of_stock_views"] == 0)
     if zero_oos.any():
         df.loc[zero_oos, "out_of_stock_views"] = (
@@ -174,36 +203,45 @@ def _apply_stock_out(
 def _apply_ad_budget_exhaustion(
     df: pd.DataFrame, mask: pd.Series, spec: ScenarioSpec
 ) -> pd.DataFrame:
-    """Front-load ad spend early in the day and zero it out after exhaust_hour."""
+    """Front-load ad spend early in local time and zero it out after exhaust_hour.
+
+    Only paid-traffic-attributed sessions (equal to the delta in ``ad_clicks``)
+    are added or removed, leaving organic sessions untouched so the session drop
+    is fully explained by the drop in ``ad_clicks``.
+    """
     exhaust_hour = int(spec.params.get("exhaust_hour", 10))
     early_multiplier = float(spec.params.get("early_multiplier", 2.2))
-    post_traffic_factor = float(spec.params.get("post_traffic_factor", 0.70))
+    country = spec.affected_segment.get("country", "")
+    utc_offset = int(
+        spec.params.get("utc_offset_hours", _DEFAULT_UTC_OFFSETS.get(country, 0))
+    )
 
-    hours = pd.to_datetime(df["timestamp"], utc=True).dt.hour
-    early_mask = mask & (hours < exhaust_hour)
-    late_mask = mask & (hours >= exhaust_hour)
+    local_hours = (
+        pd.to_datetime(df["timestamp"], utc=True) + pd.Timedelta(hours=utc_offset)
+    ).dt.hour
+    early_mask = mask & (local_hours < exhaust_hour)
+    late_mask = mask & (local_hours >= exhaust_hour)
 
+    # Early hours: ad clicks spike and add their delta to sessions + downstream funnel.
+    old_early_sessions = df.loc[early_mask, "sessions"].astype(float)
+    old_early_clicks = df.loc[early_mask, "ad_clicks"].astype(float)
     _scale_int_columns(df, early_mask, ["ad_impressions", "ad_clicks"], early_multiplier)
     _scale_float_columns(df, early_mask, ["ad_spend"], early_multiplier)
+    click_gain = df.loc[early_mask, "ad_clicks"].astype(float) - old_early_clicks
+    early_ratio = ((old_early_sessions + click_gain) / old_early_sessions.replace(0, 1)).clip(
+        lower=1.0
+    )
+    _scale_funnel_by_series(df, early_mask, early_ratio)
 
+    # Late hours: ad spend/clicks drop to 0, removing only the paid-click sessions.
+    old_late_sessions = df.loc[late_mask, "sessions"].astype(float)
+    lost_clicks = df.loc[late_mask, "ad_clicks"].astype(float)
     df.loc[late_mask, ["ad_impressions", "ad_clicks"]] = 0
     df.loc[late_mask, "ad_spend"] = 0.0
-    _scale_int_columns(
-        df,
-        late_mask,
-        [
-            "sessions",
-            "searches",
-            "search_clicks",
-            "cart_adds",
-            "checkouts",
-            "payment_attempts",
-            "orders",
-            "refunds",
-        ],
-        post_traffic_factor,
-    )
-    _scale_float_columns(df, late_mask, ["revenue"], post_traffic_factor)
+    new_late_sessions = (old_late_sessions - lost_clicks).clip(lower=0.0)
+    late_ratio = (new_late_sessions / old_late_sessions.replace(0, 1)).clip(lower=0.0)
+    _scale_funnel_by_series(df, late_mask, late_ratio)
+
     _enforce_funnel_bounds(df, mask)
     return df
 
@@ -211,24 +249,10 @@ def _apply_ad_budget_exhaustion(
 def _apply_planned_promo(
     df: pd.DataFrame, mask: pd.Series, spec: ScenarioSpec
 ) -> pd.DataFrame:
-    """Lift traffic and full funnel for a planned promotional campaign."""
+    """Lift traffic, ads, recommendations, and funnel uniformly for a planned promo."""
     lift_factor = float(spec.params.get("lift_factor", 1.25))
-    _scale_int_columns(
-        df,
-        mask,
-        [
-            "sessions",
-            "searches",
-            "search_clicks",
-            "cart_adds",
-            "checkouts",
-            "payment_attempts",
-            "orders",
-            "refunds",
-        ],
-        lift_factor,
-    )
-    _scale_float_columns(df, mask, ["revenue"], lift_factor)
+    _scale_int_columns(df, mask, _ALL_TRAFFIC_INT_COLS, lift_factor)
+    _scale_float_columns(df, mask, _ALL_TRAFFIC_FLOAT_COLS, lift_factor)
     _enforce_funnel_bounds(df, mask)
     return df
 
@@ -236,26 +260,10 @@ def _apply_planned_promo(
 def _apply_holiday(
     df: pd.DataFrame, mask: pd.Series, spec: ScenarioSpec
 ) -> pd.DataFrame:
-    """Apply a country-wide holiday traffic/order shift."""
+    """Apply a country-wide holiday shift uniformly across traffic, ads, and funnel."""
     traffic_factor = float(spec.params.get("traffic_factor", 0.80))
-    _scale_int_columns(
-        df,
-        mask,
-        [
-            "sessions",
-            "searches",
-            "search_clicks",
-            "recommendation_impressions",
-            "recommendation_clicks",
-            "cart_adds",
-            "checkouts",
-            "payment_attempts",
-            "orders",
-            "refunds",
-        ],
-        traffic_factor,
-    )
-    _scale_float_columns(df, mask, ["revenue"], traffic_factor)
+    _scale_int_columns(df, mask, _ALL_TRAFFIC_INT_COLS, traffic_factor)
+    _scale_float_columns(df, mask, _ALL_TRAFFIC_FLOAT_COLS, traffic_factor)
     _enforce_funnel_bounds(df, mask)
     return df
 
@@ -278,12 +286,81 @@ _SCENARIO_HANDLERS: dict[str, Callable[[pd.DataFrame, pd.Series, ScenarioSpec], 
 }
 
 
+def make_stock_out_hooks(
+    category: str,
+    start_date: pd.Timestamp | str,
+    end_date: pd.Timestamp | str,
+    delivery_delay_days: int = 5,
+    order_qty_factor: float = 1.0,
+) -> InventoryHooks:
+    """Create ``InventoryHooks`` that inject late deliveries or under-ordering.
+
+    Pass the returned hooks to ``simulator.generate(cfg, inventory_hooks=...)`` so
+    ``inventory_daily`` and ``purchase_orders`` contain genuine supply-chain evidence.
+    """
+    start_d = _ensure_utc(start_date).normalize()
+    end_d = _ensure_utc(end_date).normalize()
+
+    def _in_scope(product_row: pd.Series, order_date: pd.Timestamp) -> bool:
+        od = _ensure_utc(order_date).normalize()
+        return product_row["category"] == category and start_d <= od <= end_d
+
+    def _delay(product_row: pd.Series, order_date: pd.Timestamp) -> int:
+        return delivery_delay_days if _in_scope(product_row, order_date) else 0
+
+    def _qty(product_row: pd.Series, order_date: pd.Timestamp) -> float:
+        return order_qty_factor if _in_scope(product_row, order_date) else 1.0
+
+    return InventoryHooks(
+        delivery_delay=_delay if delivery_delay_days else None,
+        order_qty_factor=_qty if order_qty_factor != 1.0 else None,
+    )
+
+
+def build_inventory_hooks(scenarios: list[ScenarioSpec]) -> InventoryHooks | None:
+    """Combine ``stock_out`` scenarios into a single ``InventoryHooks`` object."""
+    stock_specs = [s for s in scenarios if s.scenario_type == "stock_out"]
+    if not stock_specs:
+        return None
+
+    def _delay(product_row: pd.Series, order_date: pd.Timestamp) -> int:
+        od = _ensure_utc(order_date).normalize()
+        delay = 0
+        for s in stock_specs:
+            cat = s.affected_segment.get("category")
+            if cat and product_row["category"] != cat:
+                continue
+            # Start delaying POs slightly before the stock-out window so shelves empty on time.
+            lookback_days = int(s.params.get("po_lookback_days", 5))
+            start_d = _ensure_utc(s.start_time).normalize() - pd.Timedelta(days=lookback_days)
+            end_d = _ensure_utc(s.end_time).normalize()
+            if start_d <= od <= end_d:
+                delay = max(delay, int(s.params.get("delivery_delay_days", 5)))
+        return delay
+
+    def _qty(product_row: pd.Series, order_date: pd.Timestamp) -> float:
+        od = _ensure_utc(order_date).normalize()
+        factor = 1.0
+        for s in stock_specs:
+            cat = s.affected_segment.get("category")
+            if cat and product_row["category"] != cat:
+                continue
+            lookback_days = int(s.params.get("po_lookback_days", 5))
+            start_d = _ensure_utc(s.start_time).normalize() - pd.Timedelta(days=lookback_days)
+            end_d = _ensure_utc(s.end_time).normalize()
+            if start_d <= od <= end_d:
+                factor = min(factor, float(s.params.get("order_qty_factor", 1.0)))
+        return factor
+
+    return InventoryHooks(delivery_delay=_delay, order_qty_factor=_qty)
+
+
 def _build_event_row(event_id: str, spec: ScenarioSpec) -> dict[str, Any]:
     event_start = spec.start_time - pd.Timedelta(minutes=spec.event_lead_minutes)
-    event_end = None if spec.event_type == "release" else spec.end_time.isoformat()
+    event_end = None if spec.event_type == "release" else _format_utc_z(spec.end_time)
     return {
         "event_id": event_id,
-        "start_time": event_start.isoformat(),
+        "start_time": _format_utc_z(event_start),
         "end_time": event_end,
         "event_type": spec.event_type,
         "planned": bool(spec.planned),
@@ -303,8 +380,8 @@ def _build_ground_truth_entry(
         "kind": spec.kind,
         "root_cause": spec.root_cause,
         "description": spec.description,
-        "start_time": spec.start_time.isoformat(),
-        "end_time": spec.end_time.isoformat(),
+        "start_time": _format_utc_z(spec.start_time),
+        "end_time": _format_utc_z(spec.end_time),
         "affected_segment": dict(spec.affected_segment),
         "primary_metric": spec.primary_metric,
         "downstream_metrics": list(spec.downstream_metrics),
@@ -324,13 +401,18 @@ def inject_scenarios(
     df: pd.DataFrame,
     scenarios: list[ScenarioSpec],
     ground_truth_path: str | Path | None = None,
+    apply_stock_out_to_df: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     """Apply fault and innocent scenarios to baseline marketplace data.
+
+    Set ``apply_stock_out_to_df=False`` when ``df`` was already generated with
+    ``inventory_hooks=build_inventory_hooks(scenarios)`` so stock-outs are not
+    double-applied.
 
     Returns ``(modified_df, events_df, ground_truth_dict)`` conforming to
     ``contracts/contracts.md``.
     """
-    missing_cols = [col for col in MARKETPLACE_COLUMNS if col not in df.columns]
+    missing_cols = [col for col in MARKETPLACE_HOURLY_COLUMN_NAMES if col not in df.columns]
     if missing_cols:
         raise ValueError(f"Missing required marketplace columns: {missing_cols}")
 
@@ -340,7 +422,7 @@ def inject_scenarios(
     event_rows: list[dict[str, Any]] = []
     gt_entries: list[dict[str, Any]] = []
 
-    for idx, spec in enumerate(scenarios, start=1):
+    for spec in scenarios:
         handler = _SCENARIO_HANDLERS.get(spec.scenario_type)
         if handler is None:
             raise ValueError(f"Unsupported scenario_type: {spec.scenario_type}")
@@ -365,12 +447,15 @@ def inject_scenarios(
             params=spec.params,
         )
 
-        mask = _segment_mask(modified_df, start_utc, end_utc, normalized_spec.affected_segment)
-        modified_df = handler(modified_df, mask, normalized_spec)
+        if not (normalized_spec.scenario_type == "stock_out" and not apply_stock_out_to_df):
+            mask = _segment_mask(
+                modified_df, start_utc, end_utc, normalized_spec.affected_segment
+            )
+            modified_df = handler(modified_df, mask, normalized_spec)
 
         event_id: str | None = None
         if normalized_spec.event_type is not None:
-            event_id = f"evt_{idx:03d}"
+            event_id = f"evt_{len(event_rows) + 1:03d}"
             event_rows.append(_build_event_row(event_id, normalized_spec))
 
         gt_entries.append(_build_ground_truth_entry(normalized_spec, event_id))
@@ -421,26 +506,32 @@ def default_fault_scenarios(anchor_time: pd.Timestamp | str) -> list[ScenarioSpe
             params={"drop_rate": 0.50},
         ),
         ScenarioSpec(
-            scenario_id="scn_de_electronics_stockout",
+            scenario_id="scn_electronics_stockout",
             kind="fault",
             scenario_type="stock_out",
             root_cause="inventory_stock_out",
-            description="Supplier stock-out in DE electronics",
+            description="Supplier delivery delay caused stock-outs in electronics",
             start_time=t0 + pd.Timedelta(days=2),
             end_time=t0 + pd.Timedelta(days=2, hours=20),
-            affected_segment={"country": "DE", "category": "electronics"},
+            affected_segment={"category": "electronics"},
             primary_metric="out_of_stock_rate",
             downstream_metrics=["cart_adds", "orders", "revenue"],
             event_type=None,
             planned=False,
-            params={"listing_drop_rate": 0.40, "oos_multiplier": 4.0, "conversion_drop_rate": 0.45},
+            params={
+                "delivery_delay_days": 5,
+                "po_lookback_days": 5,
+                "listing_drop_rate": 0.40,
+                "oos_multiplier": 4.0,
+                "conversion_drop_rate": 0.45,
+            },
         ),
         ScenarioSpec(
             scenario_id="scn_fr_ad_exhaustion",
             kind="fault",
             scenario_type="ad_budget_exhaustion",
             root_cause="ad_budget_spent_too_fast",
-            description="Daily ad budget exhausted before 10:00 UTC in FR",
+            description="Daily ad budget exhausted before 10:00 local time in FR",
             start_time=t0 + pd.Timedelta(days=3),
             end_time=t0 + pd.Timedelta(days=3, hours=23),
             affected_segment={"country": "FR"},
@@ -448,7 +539,7 @@ def default_fault_scenarios(anchor_time: pd.Timestamp | str) -> list[ScenarioSpe
             downstream_metrics=["ad_clicks", "sessions", "orders", "revenue"],
             event_type=None,
             planned=False,
-            params={"exhaust_hour": 10, "early_multiplier": 2.2, "post_traffic_factor": 0.70},
+            params={"exhaust_hour": 10, "early_multiplier": 2.2, "utc_offset_hours": 1},
         ),
     ]
 
