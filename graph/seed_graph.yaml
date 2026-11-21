@@ -25,6 +25,30 @@
   status: uncertain
   source: seed
 
+- from: product_clicks
+  to: cart_adds
+  type: formula
+  formula: "cart_adds = product_clicks * add_to_cart_rate"
+  confidence: 1.0
+  status: uncertain
+  source: seed
+
+- from: search_clicks
+  to: product_clicks
+  type: formula
+  formula: "product_clicks = search_clicks + recommendation_clicks + ad_clicks"
+  confidence: 1.0
+  status: uncertain
+  source: seed
+
+- from: sessions
+  to: searches
+  type: formula
+  formula: "searches = sessions * searches_per_session"
+  confidence: 1.0
+  status: uncertain
+  source: seed
+
 - from: searches
   to: search_clicks
   type: formula

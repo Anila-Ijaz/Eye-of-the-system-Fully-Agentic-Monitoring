@@ -22,12 +22,13 @@ from graph import (
 SEED_YAML = Path(__file__).resolve().parent.parent / "graph" / "seed_graph.yaml"
 
 METRIC_DEFS: dict[str, dict[str, Any]] = {
-    "orders": {"unit": "count", "dimensions": ["country", "platform", "category"]},
-    "revenue": {"unit": "currency_eur", "dimensions": ["country", "platform", "category"]},
-    "sessions": {"unit": "count", "dimensions": ["country", "platform", "category"]},
-    "payment_attempts": {"unit": "count", "dimensions": ["country", "platform", "category"]},
+    "orders": {"unit": "count", "is_additive": True, "dimensions": ["country", "platform", "category"]},
+    "revenue": {"unit": "currency_eur", "is_additive": True, "dimensions": ["country", "platform", "category"]},
+    "sessions": {"unit": "count", "is_additive": True, "dimensions": ["country", "platform", "category"]},
+    "payment_attempts": {"unit": "count", "is_additive": True, "dimensions": ["country", "platform", "category"]},
     "payment_success_rate": {
         "unit": "ratio",
+        "is_additive": False,
         "dimensions": ["country", "platform", "category"],
         "weight_metric": "payment_attempts",
     },
@@ -45,15 +46,17 @@ def _make_synthetic_df() -> pd.DataFrame:
                     sessions = int(round(1000 * scale))
                     searches = int(round(600 * scale))
                     search_clicks = int(round(210 * scale))
+                    recommendation_clicks = int(round(60 * scale))
+                    ad_impressions = int(round(1500 * scale))
+                    ad_clicks = int(round(30 * scale))
+                    ad_spend = round(ad_clicks * 0.75, 2)
+                    product_clicks = search_clicks + recommendation_clicks + ad_clicks
                     cart_adds = int(round(180 * scale))
                     checkouts = int(round(90 * scale))
                     payment_attempts = int(round(80 * scale))
                     orders = int(round(75 * scale))
                     refunds = int(round(4 * scale))
                     revenue = round(orders * 60.0, 2)
-                    ad_impressions = int(round(1500 * scale))
-                    ad_clicks = int(round(30 * scale))
-                    ad_spend = round(ad_clicks * 0.75, 2)
                     rows.append(
                         {
                             "timestamp": ts,
@@ -63,6 +66,8 @@ def _make_synthetic_df() -> pd.DataFrame:
                             "sessions": sessions,
                             "searches": searches,
                             "search_clicks": search_clicks,
+                            "recommendation_clicks": recommendation_clicks,
+                            "product_clicks": product_clicks,
                             "cart_adds": cart_adds,
                             "checkouts": checkouts,
                             "payment_attempts": payment_attempts,
@@ -87,6 +92,8 @@ def _make_compute(df: pd.DataFrame):
             "payment_success_rate": ("orders", "payment_attempts"),
             "payment_attempt_rate": ("payment_attempts", "checkouts"),
             "checkout_rate": ("checkouts", "cart_adds"),
+            "add_to_cart_rate": ("cart_adds", "product_clicks"),
+            "searches_per_session": ("searches", "sessions"),
             "search_ctr": ("search_clicks", "searches"),
             "aov": ("revenue", "orders"),
             "refund_rate": ("refunds", "orders"),
@@ -126,7 +133,7 @@ def _drop_slice(compute, dim: str, value: str):
 
 def test_seed_yaml_loads_and_validates() -> None:
     mg = MetricGraph.load(SEED_YAML)
-    assert len(mg.edges("formula")) == 16  # 8 formulas x 2 inputs each
+    assert len(mg.edges("formula")) == 23  # 10 two-input formulas + 1 three-input formula
     assert len(mg.edges("breakdown")) == 15  # 5 metrics x 3 dimensions
     assert len(mg.edges("possible_cause")) == 3
     assert all(e.status == "uncertain" for e in mg.edges())
@@ -144,7 +151,7 @@ def test_all_seed_formulas_and_breakdowns_pass_on_clean_data() -> None:
         start="2026-10-01T00:00:00Z",
         end="2026-10-01T03:00:00Z",
     )
-    assert len(results) == 23  # 8 formulas + 15 breakdowns
+    assert len(results) == 26  # 11 formulas + 15 breakdowns
     assert all(res.outcome == "pass" for res in results.values())
     assert all(e.status == "confirmed" for e in mg.edges("formula"))
     assert all(e.status == "confirmed" for e in mg.edges("breakdown"))
@@ -192,11 +199,20 @@ def test_rate_breakdown_with_and_without_weight_metric() -> None:
     )
     assert ok_res.outcome == "pass"
 
-    no_weight_def = {"unit": "ratio", "dimensions": ["country", "platform", "category"]}
+    no_weight_def = {"unit": "ratio", "is_additive": False, "dimensions": ["country", "platform", "category"]}
     skip_res = check_breakdown(
         edge, no_weight_def, compute, "2026-10-01T00:00:00Z", "2026-10-01T03:00:00Z"
     )
     assert skip_res.outcome == "skipped"
+
+
+def test_non_additive_currency_metric_is_not_summed() -> None:
+    df = _make_synthetic_df()
+    compute = _make_compute(df)
+    edge = GraphEdge(from_metric="aov", to_metric="aov", type="breakdown", dimension="country")
+    aov_def = {"unit": "currency_eur", "is_additive": False, "dimensions": ["country"]}
+    res = check_breakdown(edge, aov_def, compute, "2026-10-01T00:00:00Z", "2026-10-01T03:00:00Z")
+    assert res.outcome == "skipped"
 
 
 def test_parse_formula_rejects_unsafe_syntax() -> None:
