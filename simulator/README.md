@@ -15,7 +15,11 @@ python -m pytest
 suites start at 10:00 UTC on the first day of the last week, so there is at
 least a week of normal history before them. Stock-outs are produced through
 late supplier deliveries (`InventoryHooks`), so `purchase_orders.csv` and
-`inventory_daily.csv` hold the evidence. `ground_truth.json` is written next
+`inventory_daily.csv` hold the evidence. A stock-out's ground-truth window is
+set from the data: it runs from the first to the last day on which the
+out-of-stock view share is more than 2 percentage points above the same day
+without the fault. That includes the days the shelves stay empty after the
+supplier delays stop. `ground_truth.json` is written next
 to the data. Only tests and L7 scoring may read it; L4 to L6 must not.
 
 From Python (for example the L7 demo script):
