@@ -70,6 +70,30 @@ stock-outs of top products, which the simulator produces on purpose.
 The ground truth's `end_time` is the start of the last hour, so a flagged end
 one hour later is a match.
 
+## Triage: what gets reported (with Person B's modules)
+
+`monitoring.triage.triage(episode, calendar, dq_checker, volume_metric=...)`
+decides for each episode:
+
+1. **Data quality first.** Missing or stale data gives `insufficient_data`,
+   with any matching `data_delay` event attached.
+2. **Planned events** (campaign, holiday) that cover the whole segment. A
+   stated effect ("+25% sessions") moves the expected value for volume
+   metrics, and the range is widened ×1.5 for uncertainty. If the actual
+   value is inside that range, the result is `suppress_planned`. A UK promo
+   covers `UK` and `UK/android`, but not the all-country total: there it's
+   only context.
+3. **Otherwise `report`**, with unplanned events (releases up to 6 hours
+   before the anomaly) attached as candidate causes.
+
+The joint check on the simulator data
+([tests/test_l4_joint.py](../tests/test_l4_joint.py)):
+
+- All 4 faults are reported, and none of their symptoms is suppressed.
+- The payment failure points at the Android release `evt_001`.
+- The UK promo and the US holiday are `suppress_planned`.
+- The late data is `insufficient_data`.
+
 ## For Person B (what to watch, data quality, planned events)
 
 - `Detector.score(...)` returns every hour, with `actual`, `expected`,

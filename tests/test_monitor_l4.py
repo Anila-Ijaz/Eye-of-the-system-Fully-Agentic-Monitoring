@@ -6,10 +6,10 @@ import pandas as pd
 import pytest
 
 from graph import GraphEdge, MetricGraph
-from monitor.calendar import EventCalendar
-from monitor.data_quality import check_dq
-from monitor.priorities import score_metrics, select_watchlist
-from monitor.triage import AdaptedAnomaly, triage
+from monitoring.event_calendar import EventCalendar
+from monitoring.data_quality import check_dq
+from monitoring.priorities import score_metrics, select_watchlist
+from monitoring.triage import AdaptedAnomaly, triage
 
 SLICES = {
     "country": ["DE", "UK"],

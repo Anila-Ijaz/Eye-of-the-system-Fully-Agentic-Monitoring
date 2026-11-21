@@ -11,8 +11,8 @@ from typing import Any, Callable, Literal, Mapping, Protocol, runtime_checkable
 
 import pandas as pd
 
-from monitor.calendar import EventCalendar, ExplanationResult
-from monitor.data_quality import DQResult
+from monitoring.event_calendar import EventCalendar, ExplanationResult
+from monitoring.data_quality import DQResult
 
 Action = Literal["report", "suppress_planned", "insufficient_data"]
 DQCheckerFn = Callable[[pd.Timestamp, pd.Timestamp, dict[str, str]], DQResult]
@@ -110,8 +110,14 @@ def triage(
     calendar: EventCalendar,
     dq_checker: DQCheckerFn,
     default_multiplier: float = 1.5,
+    volume_metric: Callable[[str], bool] | None = None,
 ) -> TriageDecision:
-    """Decide whether to ``report``, ``suppress_planned``, or mark ``insufficient_data``."""
+    """Decide whether to ``report``, ``suppress_planned``, or mark ``insufficient_data``.
+
+    ``volume_metric(name)`` says whether a planned event's stated effect
+    ("+25% sessions") applies to the metric. Pass e.g.
+    ``lambda m: registry.get(m).is_additive``; by default it applies to all.
+    """
     item = adapt_anomaly(anomaly)
     if item.start >= item.end:
         raise ValueError(f"Anomaly start ({item.start}) must be before end ({item.end})")
@@ -129,25 +135,31 @@ def triage(
             )
         return TriageDecision("insufficient_data", reasons, dq, events)
 
-    # 2. Planned events (campaign / holiday).
+    # 2. Planned events (campaign / holiday) that cover the whole segment.
     if events.planned_events:
-        mult = calendar.sensitivity_multiplier(
-            item.start,
-            item.end,
-            item.segment,
-            metric=item.metric,
-            default_multiplier=default_multiplier,
-        )
-        widened_lower = item.expected - mult * max(0.0, item.expected - item.lower)
-        widened_upper = item.expected + mult * max(0.0, item.upper - item.expected)
         ev_names = ", ".join(f"{e.event_id} ({e.event_type})" for e in events.planned_events)
+        factor = calendar.expected_effect_factor(item.start, item.end, item.segment, metric=item.metric)
+        is_volume = volume_metric(item.metric) if volume_metric is not None else True
+        if factor is not None and is_volume:
+            # "+25% sessions": the expectation moves by the stated effect; the
+            # range is then widened for uncertainty about the effect size
+            expected, lower, upper = item.expected * factor, item.lower * factor, item.upper * factor
+            mult = default_multiplier
+            how = f"expected x{factor:.2f} from the stated effect, range widened x{mult:.2f}"
+        else:
+            expected, lower, upper = item.expected, item.lower, item.upper
+            mult = (default_multiplier if factor is not None else calendar.sensitivity_multiplier(
+                item.start, item.end, item.segment, metric=item.metric, default_multiplier=default_multiplier))
+            how = f"range widened x{mult:.2f}"
+        widened_lower = expected - mult * max(0.0, expected - lower)
+        widened_upper = expected + mult * max(0.0, upper - expected)
 
         if widened_lower <= item.actual <= widened_upper:
             return TriageDecision(
                 "suppress_planned",
                 [
                     f"planned event(s) {ev_names} active; actual={item.actual:.2f} "
-                    f"within widened range [{widened_lower:.2f}, {widened_upper:.2f}] (x{mult:.2f})"
+                    f"within adjusted range [{widened_lower:.2f}, {widened_upper:.2f}] ({how})"
                 ],
                 dq,
                 events,
@@ -155,12 +167,17 @@ def triage(
 
         reasons = [
             f"planned event(s) {ev_names} active, but actual={item.actual:.2f} "
-            f"exceeds widened range [{widened_lower:.2f}, {widened_upper:.2f}]"
+            f"is outside the adjusted range [{widened_lower:.2f}, {widened_upper:.2f}] ({how})"
         ]
     else:
         reasons = [
             f"anomaly on {item.metric} (actual={item.actual:.2f}, expected={item.expected:.2f}, score={item.score:.2f})"
         ]
+
+    # Planned events covering only part of the segment are context, not an explanation.
+    if events.partial_planned_events:
+        part = ", ".join(f"{e.event_id} ({e.event_type}, {_scope(e)})" for e in events.partial_planned_events)
+        reasons.append(f"planned event(s) {part} cover only part of this segment; drill down to separate them")
 
     # 3. Report, attaching any unplanned events (e.g. releases) as candidate causes.
     if events.unplanned_events:
@@ -168,3 +185,8 @@ def triage(
         reasons.append(f"candidate unplanned event(s): {causes}")
 
     return TriageDecision("report", reasons, dq, events)
+
+
+def _scope(ev: Any) -> str:
+    dims = [f"{d}={getattr(ev, d)}" for d in ("country", "platform", "category") if getattr(ev, d)]
+    return ", ".join(dims) or "everywhere"
