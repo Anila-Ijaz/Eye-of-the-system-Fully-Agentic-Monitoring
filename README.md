@@ -19,5 +19,6 @@ Built for the Almedia track "Eye of the System: Fully Agentic Monitoring".
 
 ## Status
 
-- L1 baseline generator: done ([simulator/README.md](simulator/README.md)).
+- L1 simulator (baseline generator + scenario injector): done ([simulator/README.md](simulator/README.md)).
+- L2 metric registry + calculation engine: done ([graph/README.md](graph/README.md)).
 - Everything else: not started.
