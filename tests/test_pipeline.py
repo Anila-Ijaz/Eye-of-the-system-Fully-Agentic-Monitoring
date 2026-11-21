@@ -75,3 +75,26 @@ def test_cli(tmp_path, capsys):
     printed = capsys.readouterr().out
     assert "injected 4 scenarios" in printed
     assert (tmp_path / "ground_truth.json").exists()
+
+
+def test_stock_out_window_matches_what_happened(tmp_path):
+    """The ground truth covers the days the stock-out is visible, including the
+    recovery tail after the supplier delays stop, and nothing more."""
+    from simulator.generator import build_world
+    from simulator.pipeline import STOCK_OUT_EXCESS_THRESHOLD, observed_stock_out_days
+
+    cfg = SimConfig(start="2026-10-05", days=28, seed=42)
+    result, truth = build_dataset(cfg, "faults", anchor="2026-10-12T10:00:00Z", out_dir=tmp_path)
+    s = next(x for x in truth["scenarios"] if x["scenario_id"] == "scn_electronics_stockout")
+    start, end = pd.Timestamp(s["start_time"]), pd.Timestamp(s["end_time"])
+    configured_end = pd.Timestamp("2026-10-12T10:00:00Z") + pd.Timedelta(days=6, hours=13)
+
+    days = observed_stock_out_days(result.world, build_world(cfg).inventory_daily, "electronics")
+    excess = days["excess"]
+    assert excess[start.normalize()] > STOCK_OUT_EXCESS_THRESHOLD
+    assert excess[end.normalize()] > STOCK_OUT_EXCESS_THRESHOLD
+    assert (excess[excess.index > end] <= STOCK_OUT_EXCESS_THRESHOLD).all()  # recovered
+    assert (excess[excess.index < start.normalize()] <= STOCK_OUT_EXCESS_THRESHOLD).all()
+    assert end > configured_end  # shelves stay empty after the delays stop
+    assert end < result.marketplace_hourly["timestamp"].max()  # recovery happens inside the data
+    assert json.loads((tmp_path / "ground_truth.json").read_text()) == truth
