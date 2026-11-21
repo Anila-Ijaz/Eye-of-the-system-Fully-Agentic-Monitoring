@@ -8,3 +8,4 @@ venv/
 *.log
 data/generated/
 .DS_Store
+Thumbs.db
