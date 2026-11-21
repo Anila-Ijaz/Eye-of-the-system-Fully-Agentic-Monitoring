@@ -60,7 +60,7 @@
 - from: orders
   to: revenue
   type: formula
-  formula: "revenue = orders * aov"
+  formula: "revenue = orders * average_order_value"
   confidence: 1.0
   status: uncertain
   source: seed

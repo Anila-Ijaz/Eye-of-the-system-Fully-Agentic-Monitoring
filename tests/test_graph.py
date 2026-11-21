@@ -95,7 +95,7 @@ def _make_compute(df: pd.DataFrame):
             "add_to_cart_rate": ("cart_adds", "product_clicks"),
             "searches_per_session": ("searches", "sessions"),
             "search_ctr": ("search_clicks", "searches"),
-            "aov": ("revenue", "orders"),
+            "average_order_value": ("revenue", "orders"),
             "refund_rate": ("refunds", "orders"),
             "ad_ctr": ("ad_clicks", "ad_impressions"),
             "cost_per_click": ("ad_spend", "ad_clicks"),
@@ -209,7 +209,12 @@ def test_rate_breakdown_with_and_without_weight_metric() -> None:
 def test_non_additive_currency_metric_is_not_summed() -> None:
     df = _make_synthetic_df()
     compute = _make_compute(df)
-    edge = GraphEdge(from_metric="aov", to_metric="aov", type="breakdown", dimension="country")
+    edge = GraphEdge(
+        from_metric="average_order_value",
+        to_metric="average_order_value",
+        type="breakdown",
+        dimension="country",
+    )
     aov_def = {"unit": "currency_eur", "is_additive": False, "dimensions": ["country"]}
     res = check_breakdown(edge, aov_def, compute, "2026-10-01T00:00:00Z", "2026-10-01T03:00:00Z")
     assert res.outcome == "skipped"
