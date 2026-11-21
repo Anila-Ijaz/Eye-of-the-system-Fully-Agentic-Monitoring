@@ -6,6 +6,13 @@
 Prints the candidates for each metric. ``--save`` writes all candidate edges
 in the graph YAML format (status "uncertain", source "auto_discovered") for
 the validation step.
+
+With ``--apply`` the full L3 step runs: candidates are validated on the data
+(graph.extend), the metric is registered and the graph is extended.
+
+    python -m extension --metric extension/examples/new_metrics.yaml --apply
+        --save-graph data/generated/graph_extended.yaml
+        --save-metrics data/generated/metrics_extended.yaml
 """
 
 from __future__ import annotations
@@ -32,6 +39,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--graph", default=str(DEFAULT_GRAPH), help="existing graph edges")
     ap.add_argument("--max-lag", type=int, default=6, help="hours of lead/lag to test in correlations")
     ap.add_argument("--save", default=None, help="write candidate edges (graph YAML format) here")
+    ap.add_argument("--apply", action="store_true",
+                    help="validate the candidates, register the metric and extend the graph")
+    ap.add_argument("--save-graph", default=None, help="with --apply: write the extended graph here")
+    ap.add_argument("--save-metrics", default=None, help="with --apply: write the extended metric list here")
     args = ap.parse_args(argv)
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -51,6 +62,8 @@ def main(argv: list[str] | None = None) -> int:
 
     engine = MetricEngine.from_dir(data, MetricRegistry.load(args.metrics))
     graph = MetricGraph.load(args.graph)
+    if args.apply:
+        return _apply(new, engine, graph, args)
     all_edges = []
     for defn in new:
         rep = discover_connections(defn, engine, graph, max_lag=args.max_lag)
@@ -82,6 +95,41 @@ def main(argv: list[str] | None = None) -> int:
         out.write_text(yaml.safe_dump([e.to_dict() for e in all_edges], sort_keys=False), encoding="utf-8")
         print(f"\nsaved {len(all_edges)} candidate edges to {out}")
     return 0
+
+
+def _apply(new, engine, graph, args) -> int:
+    import warnings
+
+    from .pipeline import add_new_metric
+
+    failed = 0
+    for defn in new:
+        print(f"\n=== {defn.name}: {defn.description}")
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)  # 0/0 hours in the checkers
+                res = add_new_metric(defn, engine, graph, max_lag=args.max_lag)
+        except MetricDefinitionError as exc:
+            print(f"  not added: {exc}")
+            failed += 1
+            continue
+        for e in res.extension.added_edges:
+            what = e.get("formula") or (f"by {e['dimension']}" if e["type"] == "breakdown" else f"{e['from']} -> {e['to']}")
+            print(f"  {e['status']:10} {e['type']:14} {what}")
+            print(f"  {'':10} {'':14} {e.get('evidence', '')}")
+        for r in res.extension.rejected_edges:
+            c = r["candidate"]
+            what = c.get("formula") or (f"by {c['dimension']}" if c["type"] == "breakdown" else f"{c['from_metric']} -> {c['to_metric']}")
+            print(f"  {'rejected':10} {c['type']:14} {what}  ({r['evidence']})")
+        print(f"  -> registered; {len(res.confirmed)} confirmed, {len(res.uncertain)} uncertain, "
+              f"{len(res.extension.rejected_edges)} rejected")
+    if args.save_graph:
+        graph.save(args.save_graph)
+        print(f"\nsaved extended graph to {args.save_graph}")
+    if args.save_metrics:
+        engine.registry.to_yaml(args.save_metrics)
+        print(f"saved extended metric list to {args.save_metrics}")
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
