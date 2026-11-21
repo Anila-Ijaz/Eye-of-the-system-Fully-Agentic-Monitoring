@@ -112,15 +112,18 @@ def check_breakdown(
             f"timestamp mismatch: total={len(total_ts)} vs slices={len(slice_ts)}",
         )
 
-    unit = str(metric_def.get("unit", ""))
-    if unit in _ADDITIVE_UNITS:
+    is_additive = metric_def.get("is_additive")
+    if is_additive is None:
+        is_additive = str(metric_def.get("unit", "")) in _ADDITIVE_UNITS
+
+    if is_additive:
         recombined = slice_df.groupby("timestamp", as_index=False)["value"].sum().rename(
             columns={"value": "recombined"}
         )
     else:
         weight_metric = metric_def.get("weight_metric")
         if not weight_metric:
-            return CheckResult("skipped", None, 0, "no weight_metric for rate breakdown")
+            return CheckResult("skipped", None, 0, "no weight_metric for non-additive breakdown")
         weight_df = compute(weight_metric, start, end, group_by=[dim]).rename(
             columns={"value": "weight"}
         )
