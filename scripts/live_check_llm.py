@@ -20,6 +20,7 @@ from agent.chooser import LLMChooser
 from agent.llm_client import ChatClient
 from agent.loop import Limits, investigate
 from agent.loop import RealInvestigationTools
+from graph.bridge import run_checks
 from graph.engine import MetricEngine
 from graph.metric_graph import MetricGraph
 from graph.registry import MetricRegistry
@@ -56,9 +57,7 @@ def main() -> int:
     mg = MetricGraph.load("graph/seed_graph.yaml")
     for name in reg.names():
         mg.graph.add_node(name)
-    for edge in mg.edges():
-        if edge.type in {"formula", "breakdown"}:
-            edge.status = "confirmed"
+    run_checks(eng, mg)  # confirm formula/breakdown edges on the data instead of by hand
 
     mh = pd.read_csv(data_dir / "marketplace_hourly.csv", parse_dates=["timestamp"])
     ev = pd.read_csv(data_dir / "events.csv")

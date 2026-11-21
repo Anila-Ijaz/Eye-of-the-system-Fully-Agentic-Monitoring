@@ -45,6 +45,16 @@ def _unexplained(state: InvestigationState) -> float:
     return max(0.05, 1.0 - max(0.0, min(1.0, float(state.explained_share))))
 
 
+def _below(tree: dict[str, dict[str, Any]], metric: str) -> list[str]:
+    """Metrics under ``metric`` in the contribution tree (breadth first)."""
+    out, frontier = [], [metric]
+    while frontier:
+        kids = [m for m, n in tree.items() if n.get("parent") in frontier and m not in out]
+        out += kids
+        frontier = kids
+    return out
+
+
 def build_menu(
     state: InvestigationState,
     graph: MetricGraph,
@@ -102,7 +112,8 @@ def build_menu(
     if "drill_dimension" in tools:
         target_metrics = [metric]
         for h in state.hypotheses:
-            if h.get("source") == "formula_component" and h.get("explained_share", 0.0) >= 0.2:
+            if (h.get("source") == "formula_component" and h.get("explained_share", 0.0) >= 0.2
+                    and not h.get("is_symptom")):
                 node = str(h["node"])
                 if node not in target_metrics:
                     target_metrics.append(node)
@@ -130,27 +141,37 @@ def build_menu(
             _, inputs, _ = parse_formula(active_formula)
             allowed_formula_inputs = set(inputs)
 
-        seen_causes: set[str] = set()
-        for u, _, data in graph.graph.in_edges(metric, data=True):
-            edge: GraphEdge = data["edge"]
-            if edge.status == "rejected" or edge.type != "possible_cause":
+        seen_causes: set[tuple[str, str]] = set()
+        targets = [(metric, 1.0)] + [
+            (m, float(n.get("share", 0.0))) for m, n in state.tree.items() if float(n.get("share", 0.0)) >= 0.2
+        ]
+        seg_of = {str(h["node"]): dict(h.get("segment") or segment) for h in state.hypotheses
+                  if h.get("source") == "formula_component" and h.get("localized")}
+        for target, weight in targets:
+            if target not in graph.graph:
                 continue
-            if allowed_formula_inputs is not None and u in allowed_formula_inputs:
-                continue
-            if u in seen_causes:
-                continue
-            seen_causes.add(u)
-            args = {"from_metric": u, "to_metric": metric, "segment": segment, "lag_hours": edge.lag_hours}
-            if action_signature("check_cause_edge", args) not in done:
-                raw_items.append(
-                    (
-                        "check_cause_edge",
-                        args,
-                        f"Check upstream cause {u} -> {metric} (lag={edge.lag_hours}h)",
-                        1.0,
-                        unexplained * 0.50 * float(edge.confidence),
+            for u, _, data in graph.graph.in_edges(target, data=True):
+                edge: GraphEdge = data["edge"]
+                if edge.status == "rejected" or edge.type != "possible_cause":
+                    continue
+                if target == metric and allowed_formula_inputs is not None and u in allowed_formula_inputs:
+                    continue
+                if (u, target) in seen_causes:
+                    continue
+                seen_causes.add((u, target))
+                # check the cause where the change was localized, if it was
+                where = next((seg_of[m] for m in [target, *_below(state.tree, target)] if m in seg_of), segment)
+                args = {"from_metric": u, "to_metric": target, "segment": where, "lag_hours": edge.lag_hours}
+                if action_signature("check_cause_edge", args) not in done:
+                    raw_items.append(
+                        (
+                            "check_cause_edge",
+                            args,
+                            f"Check upstream cause {u} -> {target} in {where or 'all'} (lag={edge.lag_hours}h)",
+                            1.0,
+                            unexplained * 0.50 * float(edge.confidence) * max(weight, 0.2) + 0.06,
+                        )
                     )
-                )
 
     # 4. Check events (including 2h lookback before window start)
     if "check_events" in tools:
@@ -170,12 +191,15 @@ def build_menu(
     # 5. Counterfactual check on localized suspect slice / top hypothesis
     if "counterfactual" in tools:
         for h in state.hypotheses:
-            if h.get("status") == "rejected":
+            if h.get("status") == "rejected" or not h.get("localized"):
                 continue
             h_seg = dict(h.get("segment") or segment)
             if not h_seg:
                 continue
-            args = {"metric": metric, "suspect_segment": h_seg}
+            cf_metric = metric
+            if h.get("source") == "formula_component" and h.get("node") and h.get("explained_share", 0.0) < 0.95:
+                cf_metric = str(h["node"])  # another cause may also move the anomaly metric
+            args = {"metric": cf_metric, "suspect_segment": h_seg}
             if action_signature("counterfactual", args) not in done:
                 cf_gain = max(0.25, float(state.explained_share) * 0.50, unexplained * 0.60)
                 raw_items.append(
