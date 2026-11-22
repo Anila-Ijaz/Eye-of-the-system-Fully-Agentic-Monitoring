@@ -486,7 +486,9 @@ class AutonomousMonitor:
         charts = []
         targets = [(iss.metric, iss.segment)]
         if iss.root and iss.root.get("node") in self.engine.registry:
-            targets.append((iss.root["node"], iss.root.get("segment") or {}))
+            root_target = (iss.root["node"], iss.root.get("segment") or {})
+            if root_target not in targets:  # don't draw the same chart twice
+                targets.append(root_target)
         for m, seg in targets:
             df = self.series(m, seg, hours=96)
             if df:
