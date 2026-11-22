@@ -111,9 +111,10 @@ button, select, input { font: inherit; }
 .brand .logo svg { width: 18px; height: 18px; }
 .brand b { font-size: 16px; letter-spacing: .2px; }
 .brand span { color: var(--nav-muted); font-size: 13px; }
-.clockbox { display: flex; align-items: center; gap: 14px; justify-self: center; min-width: 0; }
-.clock { font-size: 13px; color: var(--nav-text); white-space: nowrap; }
-.clock small { color: var(--nav-muted); margin-left: 8px; font-size: 12px; }
+.clockbox { display: flex; align-items: center; gap: 14px; justify-self: center; min-width: 0; max-width: 100%; overflow: hidden; }
+.clock { font-size: 13px; line-height: 1.35; color: var(--nav-text); white-space: nowrap; min-width: 0; overflow: hidden; }
+.clock small { display: block; color: var(--nav-muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; }
+@media (max-width: 1400px) { .brand span { display: none; } }
 .progress { width: 200px; height: 6px; background: rgba(255, 255, 255, .15); border-radius: 3px; overflow: hidden; flex-shrink: 0; }
 .progress > div { height: 100%; width: 0; background: #7fb2ff; border-radius: 3px; transition: width .4s; }
 .controls { display: flex; align-items: center; gap: 8px; }
