@@ -182,10 +182,17 @@ def build_report(issue: Issue, tracker: IssueTracker, narrator: Optional["LLMNar
         "uncertainty": uncertainty, "ruled_out": ruled_out, "recommended_actions": actions,
         "symptoms": symptoms[:12], "trail": f.get("trail", []),
         "opened_at": issue.to_dict()["opened_at"], "resolved_at": issue.to_dict()["resolved_at"],
-        "narrative": None,
+        "narrative": None, "text_by": "template", "text_fallback_reason": None,
     }
     if narrator is not None and issue.kind == "incident" and root:
-        report["narrative"] = narrator.narrate(report)
+        if hasattr(narrator, "write"):
+            text, why = narrator.write(report, f)
+        else:  # any object with narrate(report) -> text or None
+            text = narrator.narrate(report)
+            why = None if text else "narrator returned no text"
+        report["narrative"] = text
+        report["text_by"] = "llm" if text else "template"
+        report["text_fallback_reason"] = why
     report["markdown"] = to_markdown(report)
     return report
 
@@ -220,8 +227,13 @@ def to_markdown(r: dict[str, Any]) -> str:
     if r["recommended_actions"]:
         lines += ["", "### Recommended actions"] + [f"- {x}" for x in r["recommended_actions"]]
     if r["trail"]:
-        lines += ["", "### Investigation trail"] + [
-            f"{t['step']}. **{t['action']}** {t['query']} → {t['observation']}" for t in r["trail"]]
+        chosen = [t for t in r["trail"] if t.get("chosen_by")]
+        head = "### Investigation trail"
+        if chosen:
+            head += f" (model-chosen steps: {sum(t['chosen_by'] == 'llm' for t in chosen)} of {len(chosen)})"
+        lines += ["", head] + [
+            f"{t['step']}. **{t['action']}**" + (f" [{t['chosen_by']}]" if t.get("chosen_by") else "")
+            + f" {t['query']} → {t['observation']}" for t in r["trail"]]
     if r["symptoms"]:
         lines += ["", "### Also affected (symptoms)"] + [
             f"- {s['metric']} {s['direction']} in {seg_key(s['segment'])} ({s['rel_change_pct']}%)" for s in r["symptoms"]]
@@ -229,38 +241,135 @@ def to_markdown(r: dict[str, Any]) -> str:
 
 
 class LLMNarrator:
-    """Optional: a short plain-language summary written by an LLM, checked for numbers.
+    """The report's summary text, written by the report model from the structured finding.
 
-    Uses ``agent.llm_client.ChatClient`` (env vars LLM_BASE_URL, LLM_MODEL,
-    LLM_API_KEY). Any failure or any unknown number falls back to no narrative.
+    The model gets only the facts (the finding's numbers, the code-decided
+    label, evidence, impact, uncertainty, actions) and writes the text. Then
+    every number, percentage and euro amount in that text must be one of the
+    facts (rounding allowed), and the text may not call an unconfirmed cause
+    confirmed (or the reverse). If either check fails, or the call fails, the
+    model text is discarded, the template text stays, and the reason is
+    recorded. The structured finding is never changed.
+
+    The model is LLM_REPORT_MODEL (default LLM_MODEL), through ClaudeClient
+    unless a client is passed. Replies go through the same record/replay
+    cache as the step chooser.
     """
 
-    SYSTEM = ("You write a 2-3 sentence incident summary for marketplace managers from JSON facts. "
-              "Use only numbers that appear in the facts. Say clearly what is confirmed and what is only a "
-              "hypothesis. Reply as JSON: {\"narrative\": \"...\"}")
+    SYSTEM = ("You write the summary of an incident report for marketplace managers, from JSON facts produced "
+              "by a monitoring system. Write 2-4 plain sentences: what changed, where, the business impact, the "
+              "most likely cause, and what is still uncertain. Use only numbers that appear in the facts, as "
+              "written or rounded. The field \"label\" says whether the cause is confirmed; never call an "
+              "unconfirmed cause confirmed. Reply with exactly one JSON object: {\"narrative\": \"...\"}")
 
-    def __init__(self, client: Any = None):
+    def __init__(self, client: Any = None, cache: Any = None, model: Optional[str] = None):
+        from agent.llm_client import LLMCache
+
         self.client = client
+        self.cache = cache if cache is not None else LLMCache()
+        self.model = model
         self.failures = 0
+        self.used = 0
+        self.last_reason: Optional[str] = None
+        self.unavailable: Optional[str] = None
+        self._memo: dict[tuple[str, str], tuple[Optional[str], Optional[str]]] = {}
 
-    def narrate(self, report: dict[str, Any]) -> Optional[str]:
-        facts = {k: report[k] for k in ("title", "headline", "what_happened", "business_impact", "uncertainty",
-                                        "recommended_actions")}
-        try:
-            if self.client is None:
-                from agent.llm_client import ChatClient
+    @staticmethod
+    def facts(report: dict[str, Any], finding: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+        f = finding or {}
+        root = report.get("root_cause") or {}
+        out = {
+            "title": report.get("title"),
+            "label": "confirmed" if root.get("status") == "confirmed" else "not confirmed (most likely cause only)",
+            "headline": report.get("headline"),
+            "root_cause": {k: root.get(k) for k in ("node", "segment", "status", "explained_share", "missing",
+                                                     "event_id") if root.get(k) is not None},
+            "what_happened": report.get("what_happened"),
+            "business_impact": report.get("business_impact"),
+            "evidence": report.get("evidence"),
+            "uncertainty": report.get("uncertainty"),
+            "recommended_actions": report.get("recommended_actions"),
+        }
+        for k in ("metric", "segment", "time_window", "expected", "actual", "change_size", "explained_share"):
+            if k in f:
+                out[k] = f[k]
+        return out
 
-                self.client = ChatClient()
-            text = str(self.client.complete_json(self.SYSTEM, json.dumps(facts, default=str)).get("narrative", ""))
-        except Exception:  # noqa: BLE001 - the narrative is optional
-            self.failures += 1
-            return None
-        allowed = _numbers(json.dumps(facts, default=str))
-        if not text or any(n not in allowed for n in _numbers(text)):
-            self.failures += 1
-            return None
+    def narrate(self, report: dict[str, Any], finding: Optional[dict[str, Any]] = None) -> Optional[str]:
+        """The checked model text, or None (the template text is used; see ``last_reason``)."""
+        text, why = self.write(report, finding)
+        self.last_reason = why
         return text
+
+    def write(self, report: dict[str, Any], finding: Optional[dict[str, Any]] = None) -> tuple[Optional[str], Optional[str]]:
+        """(text, None) when the model text passed every check, else (None, why it was rejected)."""
+        from agent.llm_client import ClaudeClient, client_model
+
+        facts = self.facts(report, finding)
+        user = json.dumps(facts, default=str, sort_keys=True)
+        if self.cache.mode != "replay" and self.client is None:
+            if self.unavailable is None:
+                try:
+                    self.client = ClaudeClient()
+                except Exception as exc:  # noqa: BLE001 - no key / no model: template text
+                    self.unavailable = str(exc)
+            if self.client is None:
+                return None, f"LLM unavailable: {self.unavailable}"
+        model = self.model or client_model(self.client, report=True)
+        if (model, user) in self._memo:  # the same facts again (a report rebuilt without news)
+            return self._memo[(model, user)]
+        out = self._write(model, user, facts)
+        self._memo[(model, user)] = out
+        return out
+
+    def _write(self, model: str, user: str, facts: dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
+        from agent import numbers
+        from agent.llm_client import describe_error
+
+        try:
+            reply = self.cache.call(self.client, model, self.SYSTEM, user, call_model=model)
+            text = " ".join(str((reply or {}).get("narrative", "")).split())
+        except Exception as exc:  # noqa: BLE001 - the model text is optional
+            self.failures += 1
+            return None, f"LLM error: {describe_error(exc)}"[:300]
+        why = None
+        if not text:
+            why = "empty narrative"
+        elif len(text) > 1200:
+            why = "narrative too long"
+        else:
+            bad = numbers.unknown_numbers(text, facts)
+            if bad:
+                why = f"numbers not in the finding: {', '.join(bad[:5])}"
+            else:
+                why = _label_violation(text, facts["label"] == "confirmed")
+        if why:
+            self.failures += 1
+            return None, why
+        self.used += 1
+        return text, None
+
+
+def _label_violation(text: str, confirmed: bool) -> Optional[str]:
+    """The confirmed/uncertain label is code's: the text must not contradict it."""
+    low = text.lower()
+    if confirmed:
+        if re.search(r"\bnot (?:yet )?confirmed\b|\bunconfirmed\b", low):
+            return "text calls a confirmed cause unconfirmed"
+        return None
+    for m in re.finditer(r"\bconfirm(?:ed|s)?\b", low):
+        before = low[max(0, m.start() - 16): m.start()]
+        if not re.search(r"\bnot\b|n't\b|\bno\b|\byet to\b|\bto be\b|\bbefore\b|\bwithout\b", before):
+            return "text calls an unconfirmed cause confirmed"
+    return None
 
 
 def _numbers(text: str) -> set[str]:
-    return {m.replace(",", "").rstrip(".0") or "0" for m in re.findall(r"\d[\d,]*\.?\d*", text)}
+    """Numbers in ``text`` as normalized strings ("100" stays "100", "8,000.50" -> "8000.5")."""
+    out = set()
+    for m in re.findall(r"\d[\d,]*(?:\.\d+)?", text):
+        s = m.replace(",", "")
+        if "." in s:
+            s = s.rstrip("0").rstrip(".")
+        out.add(s or "0")
+    return out

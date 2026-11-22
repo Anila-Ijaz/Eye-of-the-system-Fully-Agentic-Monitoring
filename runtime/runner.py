@@ -63,6 +63,61 @@ ALWAYS_WATCH = ["orders", "revenue", "sessions", "row_count"]
 
 
 @dataclass
+class LLMSetup:
+    """What the monitor uses to choose steps and write report text."""
+
+    chooser: Any
+    narrator: Optional[LLMNarrator]
+    enabled: bool
+    mode: str
+    model: Optional[str]
+    report_model: Optional[str]
+    note: str
+    client: Any = None
+
+
+def build_llm(use_llm: Optional[bool] = None, cache_mode: Optional[str] = None,
+              cache_dir: Optional[str] = None) -> LLMSetup:
+    """Model as the primary chooser and report writer when it can be used, rules otherwise.
+
+    ``use_llm=None`` (default): on when ANTHROPIC_API_KEY and LLM_MODEL are set,
+    or in replay mode with LLM_MODEL set (replay needs no key and no network).
+    ``use_llm=False`` forces the rule-based path; ``True`` asks for the model
+    but still falls back (with a note) if it cannot be set up. Never raises.
+    """
+    import os
+
+    from agent.llm_client import ClaudeClient, LLMCache, llm_configured
+
+    try:
+        cache = LLMCache(mode=cache_mode, cache_dir=cache_dir)
+    except ValueError as exc:
+        return LLMSetup(FallbackChooser(), None, False, "live", None, None, f"LLM off: {exc}")
+    model = os.environ.get("LLM_MODEL", "").strip() or None
+    report_model = os.environ.get("LLM_REPORT_MODEL", "").strip() or model
+    if use_llm is False:
+        return LLMSetup(FallbackChooser(), None, False, cache.mode, None, None, "LLM off (rule-based chooser)")
+    if cache.mode == "replay":
+        if not model:
+            return LLMSetup(FallbackChooser(), None, False, cache.mode, None, None,
+                            "LLM off: replay mode needs LLM_MODEL (the cache is keyed by model)")
+        return LLMSetup(LLMChooser(client=None, cache=cache, model_name=model),
+                        LLMNarrator(client=None, cache=cache, model=report_model), True, cache.mode, model,
+                        report_model, f"LLM replay from {cache.dir} (no network)")
+    ok, why = llm_configured()
+    if not ok:
+        return LLMSetup(FallbackChooser(), None, False, cache.mode, None, None, f"LLM off: {why}")
+    try:
+        client = ClaudeClient()
+    except Exception as exc:  # noqa: BLE001 - monitoring must run without the model
+        return LLMSetup(FallbackChooser(), None, False, cache.mode, None, None, f"LLM off: {exc}")
+    return LLMSetup(LLMChooser(client=client, cache=cache), LLMNarrator(client=client, cache=cache), True,
+                    cache.mode, client.model, client.report_model,
+                    f"LLM on: steps by {client.model}, reports by {client.report_model} (cache {cache.mode})",
+                    client)
+
+
+@dataclass
 class FeedItem:
     time: str
     kind: str  # data, watch, detect, triage, issue, investigate, alert, inject, metric, system
@@ -81,8 +136,10 @@ class AutonomousMonitor:
         watch_budget: int = 16,
         investigate_budget: int = 2,
         reinvestigate_hours: int = 6,
-        use_llm: bool = False,
+        use_llm: Optional[bool] = None,
         on_feed: Optional[Callable[[FeedItem], None]] = None,
+        llm_cache_mode: Optional[str] = None,
+        llm_cache_dir: Optional[str] = None,
     ):
         warnings.filterwarnings("ignore", category=RuntimeWarning)
         self.live = live
@@ -108,9 +165,11 @@ class AutonomousMonitor:
         self.tracker = IssueTracker()
         self.calendar = EventCalendar.from_dataframe(live.events)
         self._n_events = len(live.events)
-        self.use_llm = use_llm
-        self.chooser = LLMChooser(mode="live") if use_llm else FallbackChooser()
-        self.narrator = LLMNarrator() if use_llm else None
+        self.llm = build_llm(use_llm, llm_cache_mode, llm_cache_dir)
+        self.use_llm = self.llm.enabled
+        self.chooser = self.llm.chooser
+        self.narrator = self.llm.narrator
+        self.steps = {"llm": 0, "total": 0}
         self.now = live.live_start
         self._open: dict[tuple[str, str, str], TrackedEpisode] = {}
         self._triage: dict[str, tuple[str, pd.Timestamp, str]] = {}  # episode key -> (action, when, reason)
@@ -119,6 +178,7 @@ class AutonomousMonitor:
         self.last_cells = pd.DataFrame()
         self._say("system", f"monitor started at {self._t(self.now)}: {len(hist):,} rows of history, "
                             f"{len(self.engine.registry)} metrics, graph checks {checks.counts['pass']} passed")
+        self._say("system", self.llm.note)
         self._pick_watchlist()
 
     # --- helpers -------------------------------------------------------------------------------
@@ -347,6 +407,8 @@ class AutonomousMonitor:
                 self._say("investigate", f"{iss.id}: investigation failed ({type(exc).__name__}: {exc})", iss.id)
                 iss.last_investigated = self.now
                 continue
+            self.steps["total"] += len(finding["trail"])
+            self.steps["llm"] += sum(t.get("chosen_by") == "llm" for t in finding["trail"])
             alert = self.tracker.set_finding(iss, finding, self.now, downstream=self._downstream(finding))
             target = self.tracker.issues[iss.merged_into] if iss.merged_into else iss
             node = (target.root or {}).get("node")
@@ -476,6 +538,22 @@ class AutonomousMonitor:
             "watchlist": self.watch_reasons,
             "open_anomalies": [e.summary() for e in self._open.values() if e.open][:60],
             "metrics": sorted(self.engine.registry.names()),
+            "llm": self.llm_stats(),
+        }
+
+    def llm_stats(self) -> dict[str, Any]:
+        """Model use in this run: steps it chose, calls, tokens, fallbacks, report texts."""
+        usage = getattr(self.llm.client, "usage", None)
+        counts = getattr(self.chooser, "counts", {})
+        nar = self.narrator
+        return {
+            "enabled": self.llm.enabled, "mode": self.llm.mode, "model": self.llm.model,
+            "report_model": self.llm.report_model, "note": self.llm.note,
+            "steps_llm": self.steps["llm"], "steps_total": self.steps["total"],
+            "step_fallbacks": int(counts.get("fallback", 0)), "stop_requests_ignored": int(counts.get("stop_ignored", 0)),
+            "calls": usage.calls if usage else 0, "call_failures": usage.failures if usage else 0,
+            "tokens_in": usage.tokens_in if usage else 0, "tokens_out": usage.tokens_out if usage else 0,
+            "reports_by_llm": nar.used if nar else 0, "reports_rejected": nar.failures if nar else 0,
         }
 
     def issue_detail(self, issue_id: str) -> Optional[dict[str, Any]]:

@@ -19,7 +19,7 @@ from monitoring.data_quality import DQResult
 from monitoring.event_calendar import EventCalendar, ExplanationResult
 from monitoring.triage import adapt_anomaly
 
-from agent.chooser import Chooser, FallbackChooser
+from agent.chooser import Choice, Chooser, FallbackChooser
 from agent.hypotheses import (
     Hypothesis,
     build_initial_hypotheses,
@@ -41,7 +41,7 @@ class Limits:
     """Budget and stopping limits for an investigation."""
 
     max_steps: int = 12
-    max_llm_calls: int = 8
+    max_llm_calls: int = 12  # one per step at most: the step budget, not the model budget, binds
     explained_threshold: float = 0.8
     min_gain: float = 0.05
 
@@ -603,6 +603,9 @@ def investigate(
                 "query": f"check_dq({item.segment})",
                 "observation": dq.detail,
                 "reason": "Data quality gate failed; stopping with insufficient evidence",
+                "chosen_by": "fallback",
+                "menu_number": None,
+                "fallback_cause": "data-quality gate (code rule, runs before any choice)",
             }
         )
         hyps = build_initial_hypotheses(item.metric, item.segment, graph, dq=dq)
@@ -648,13 +651,21 @@ def investigate(
             state.stop_reason = "max_llm_calls_reached"
             break
 
-        choice = active_chooser.choose(state.snapshot(), menu)
-        if is_llm and not choice.used_fallback:
+        try:
+            choice = active_chooser.choose(state.snapshot(), menu)
+        except Exception as exc:  # noqa: BLE001 - e.g. a replay cache miss: rule-based step instead
+            fb = FallbackChooser(min_gain=lim.min_gain).choose(state.snapshot(), menu)
+            choice = Choice(fb.item_id, fb.reason, fb.decision, fb.stop_reason, used_fallback=True,
+                            fallback_reason=f"fallback_used: chooser error: {type(exc).__name__}: {exc}"[:300],
+                            chosen_by="fallback", llm_called=is_llm, menu_number=fb.menu_number)
+        if is_llm and getattr(choice, "llm_called", not choice.used_fallback):
             state.llm_calls_used += 1
         if choice.used_fallback:
             state.fallbacks_used += 1
             state.fallback_reasons.append(choice.fallback_reason)
 
+        # Only code stops an investigation: the model's reply has no stop option, and
+        # LLMChooser turns a stop request into a rule-based step (llm_stop_ignored).
         if choice.decision == "stop" or choice.item_id is None:
             state.stop_reason = choice.stop_reason or "chooser_stopped"
             break
@@ -679,16 +690,27 @@ def investigate(
         reason = choice.reason
         if choice.used_fallback and choice.fallback_reason:
             reason = f"{reason} ({choice.fallback_reason})"
+        chosen_by = "llm" if getattr(choice, "chosen_by", "fallback") == "llm" else "fallback"
+        if chosen_by == "llm":
+            cause = None
+        elif choice.fallback_reason:
+            cause = choice.fallback_reason.removeprefix("fallback_used: ")
+        else:
+            cause = "rule-based chooser (no LLM in use)"
 
-        state.trail.append(
-            {
-                "step": state.steps_used,
-                "action": chosen_item.kind,
-                "query": query,
-                "observation": obs,
-                "reason": reason,
-            }
-        )
+        entry = {
+            "step": state.steps_used,
+            "action": chosen_item.kind,
+            "query": query,
+            "observation": obs,
+            "reason": reason,
+            "chosen_by": chosen_by,
+            "menu_number": chosen_item.number,
+            "fallback_cause": cause,
+        }
+        if getattr(choice, "stop_ignored", False):
+            entry["llm_stop_ignored"] = True
+        state.trail.append(entry)
 
     _refresh(state, hyps)
     hyps = rank_hypotheses([label_hypothesis(h) for h in hyps])

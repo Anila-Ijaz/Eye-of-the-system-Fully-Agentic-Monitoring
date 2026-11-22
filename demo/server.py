@@ -38,8 +38,10 @@ EXAMPLES = Path(__file__).resolve().parent.parent / "extension" / "examples" / "
 
 
 class DemoController:
-    def __init__(self, live: LiveMarketplace, script: Optional[dict], delay: float, use_llm: bool, out_dir: str):
-        self.mon = AutonomousMonitor(live, use_llm=use_llm)
+    def __init__(self, live: LiveMarketplace, script: Optional[dict], delay: float, use_llm: Optional[bool],
+                 out_dir: str, llm_cache_mode: Optional[str] = None, llm_cache_dir: Optional[str] = None):
+        self.mon = AutonomousMonitor(live, use_llm=use_llm, llm_cache_mode=llm_cache_mode,
+                                     llm_cache_dir=llm_cache_dir)
         self.script = script or {}
         self.delay = delay
         self.out_dir = out_dir
@@ -187,9 +189,11 @@ def _handler(ctl: DemoController):
 
 
 def serve(live: LiveMarketplace, script: Optional[dict] = None, port: int = 8050, delay: float = 0.0,
-          use_llm: bool = False, out_dir: str = "data/generated/demo_run", open_browser: bool = True) -> None:
+          use_llm: Optional[bool] = None, out_dir: str = "data/generated/demo_run", open_browser: bool = True,
+          llm_cache_mode: Optional[str] = None, llm_cache_dir: Optional[str] = None) -> None:
     print("starting the monitor (learning from the history)...", flush=True)
-    ctl = DemoController(live, script, delay, use_llm, out_dir)
+    ctl = DemoController(live, script, delay, use_llm, out_dir, llm_cache_mode, llm_cache_dir)
+    print(ctl.mon.llm.note, flush=True)
     threading.Thread(target=ctl.loop, daemon=True).start()
     server = ThreadingHTTPServer(("127.0.0.1", port), _handler(ctl))
     url = f"http://127.0.0.1:{port}"

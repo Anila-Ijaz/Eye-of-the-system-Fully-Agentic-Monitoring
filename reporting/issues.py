@@ -178,10 +178,19 @@ class IssueTracker:
         iss.investigations += 1
         iss.last_investigated = now
         prev_root = dict(iss.root) if iss.root else None
-        iss.finding = finding
         hyps = [h for h in finding.get("hypotheses", []) if h.get("status") != "rejected"]
         causes = [h for h in hyps if not h.get("is_symptom")] or hyps
         top = causes[0] if causes else None
+        # A re-investigation that finds the same cause with less evidence (it was confirmed,
+        # this window could not confirm it again) is not news: keep the confirmed finding
+        # instead of flipping the label back and forth and alerting each time.
+        if (prev_root is not None and iss.finding and prev_root.get("status") == "confirmed" and top is not None
+                and top.get("status") != "confirmed" and top["node"] == prev_root.get("node")
+                and dict(top.get("segment") or iss.segment) == prev_root.get("segment")):
+            iss.history.append({"time": _iso(now), "event": "re-investigated",
+                                "detail": "same cause, not re-confirmed in this window; the confirmed finding is kept"})
+            return None
+        iss.finding = finding
         if top is not None:
             iss.root = {"node": top["node"], "segment": dict(top.get("segment") or iss.segment),
                         "status": top["status"], "cause": top["cause"], "source": top["source"],

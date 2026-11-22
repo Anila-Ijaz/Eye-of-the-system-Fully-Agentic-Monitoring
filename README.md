@@ -85,14 +85,44 @@ Every simulated hour the runner ([runtime/runner.py](runtime/runner.py)) does th
 Only the scorecard reads the simulator's ground truth. The monitor sees rows,
 the event calendar (release log, planned campaigns) and the metric graph.
 
-### Optional LLM
+### The model at the decision points (Claude)
 
-`python -m demo --llm` uses an OpenAI-compatible model to choose investigation
-steps and write a short narrative for each report. Set `LLM_BASE_URL`,
-`LLM_MODEL` and `LLM_API_KEY` (never commit them). Every LLM answer is
-checked: off-menu choices fall back to the rule-based chooser, and a narrative
-with any number not found in the facts is dropped. Confirmations, shares and
-stop decisions are always made by the data and the rules.
+When `ANTHROPIC_API_KEY` and `LLM_MODEL` are set, Claude is the primary
+chooser of investigation steps and writes the report summaries. No flag is
+needed; `--no-llm` turns it off. Keys and model ids come only from the
+environment. Never commit them.
+
+```bash
+export ANTHROPIC_API_KEY=...          # read by the anthropic SDK; never printed or logged
+export LLM_MODEL=claude-opus-5-5      # chooses the next step
+export LLM_REPORT_MODEL=...           # writes report text (optional, default LLM_MODEL)
+python -m demo --headless
+```
+
+| The model decides | Code decides |
+|---|---|
+| which menu step runs next, and why (at most two sentences, citing evidence) | the menu, every number, hypothesis status and confidence, the confirmed/uncertain label, when to stop |
+| the report summary text | the structured finding |
+
+- **Step choice.** A reply is used only if it names a number on the menu and
+  gives a reason that cites evidence from the prompt. Anything else falls back
+  to the rule-based chooser for that step: invalid JSON, an off-menu number,
+  an empty or evidence-free reason, an error, or no key. The model has no stop
+  option. A stop request is ignored and recorded as `llm_stop_ignored`. Each
+  trail step records `chosen_by` (`llm` or `fallback`) and the reason or the
+  fallback cause. The dashboard shows "model-chosen steps: X of Y".
+- **Report text.** Every number, percentage and euro amount in the model's text
+  must appear in the structured finding (rounding allowed). The text may not
+  call an unconfirmed cause confirmed. Otherwise the template text is used and
+  the reason is recorded.
+- **Cache.** `--llm-cache-mode record|replay|live` (or `LLM_CACHE_MODE`), stored
+  in `--llm-cache-dir` (or `LLM_CACHE_DIR`, default `data/llm_cache`). The key
+  is a hash of the model and the exact prompt. Replay needs no key and no
+  network, and it reproduces the recorded trails and reports exactly.
+- **Checks you run with a key:** `python scripts/live_check_llm.py` (one call,
+  then record and replay of the fault-window investigation), and
+  `python scripts/llm_scoreboard.py --n 4` (injected faults with the model
+  versus the fallback only).
 
 ## Layer by layer
 

@@ -216,6 +216,11 @@ main {
 .timeline b { color: var(--text); text-transform: capitalize; }
 .timeline code { font-size: 12px; color: var(--text-3); word-break: break-word; }
 .timeline .why { color: var(--text-3); font-size: 12px; }
+.by { display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 9px; font-size: 10.5px; font-weight: 700;
+  line-height: 17px; vertical-align: 1px; letter-spacing: .3px; border: 1px solid var(--border-strong); color: var(--text-3); }
+.by.llm { background: var(--brand-soft); border-color: transparent; color: var(--brand-ink); }
+.by-count { float: right; font-weight: 600; text-transform: none; letter-spacing: 0; color: var(--text-3); }
+.textby { color: var(--text-3); font-size: 12px; margin: -4px 0 8px; }
 
 /* chart */
 .chart { position: relative; }
@@ -359,10 +364,27 @@ async function api(path, body) {
   return r.json();
 }
 
+// ---------------- investigation trail: who chose each step ----------------
+function trailCount(trail) {
+  const steps = (trail || []).filter((t) => t.chosen_by);
+  if (!steps.length) return "";
+  const n = steps.filter((t) => t.chosen_by === "llm").length;
+  return `<span class="by-count">model-chosen steps: ${n} of ${steps.length}</span>`;
+}
+function trailStep(t, k) {
+  const llm = t.chosen_by === "llm";
+  const badge = t.chosen_by ? `<span class="by ${llm ? "llm" : ""}" title="${llm ? "chosen by the model" : "chosen by the rule-based fallback"}">${llm ? "llm" : "fallback"}</span>` : "";
+  const reason = (t.reason || "").replace(/ \(fallback_used: .*\)$/, "");
+  const cause = !llm && t.fallback_cause ? `<br><span class="why">fallback: ${esc(t.fallback_cause)}</span>` : "";
+  return `<li data-n="${k + 1}"><b>${esc(t.action.replace(/_/g, " "))}</b>${badge} <code>${esc(t.query)}</code><br>${esc(t.observation)}` +
+    (reason ? `<br><span class="why">why: ${esc(reason)}</span>` : "") + cause + `</li>`;
+}
+
 // ---------------- header, stats, scenarios ----------------
 function renderHeader(s) {
   $("clock").innerHTML = `${esc(s.now.replace("T", " ").slice(0, 16))} UTC<small>hour ${s.hours_done} / ${s.hours_total}` +
-    (s.tick_seconds ? ` · ${s.tick_seconds}s per hour` : "") + (s.finished ? " · finished" : "") + `</small>`;
+    (s.tick_seconds ? ` · ${s.tick_seconds}s per hour` : "") + (s.finished ? " · finished" : "") +
+    (s.llm ? (s.llm.enabled ? ` · model-chosen steps: ${s.llm.steps_llm} of ${s.llm.steps_total}` : " · rules only (no LLM)") : "") + `</small>`;
   $("prog").style.width = `${100 * s.hours_done / Math.max(1, s.hours_total)}%`;
   $("play").textContent = s.paused ? "▶ Resume" : "❚❚ Pause";
   const c = s.counts;
@@ -510,7 +532,8 @@ function renderDetail() {
       <span>· opened ${esc(when(r.opened_at))}${r.resolved_at ? " · resolved " + esc(when(r.resolved_at)) : ""}</span></div>
     <div class="rtitle">${esc(r.title)}</div>
     <div class="headline ${confirmed ? "" : "unc"}">${esc(r.headline)}</div>
-    ${r.narrative ? `<p>${esc(r.narrative)}</p>` : ""}
+    ${r.narrative ? `<p>${esc(r.narrative)}</p><div class="textby">summary written by the model; every number checked against the finding</div>` : ""}
+    ${!r.narrative && r.text_fallback_reason ? `<div class="textby">template text (model text not used: ${esc(r.text_fallback_reason)})</div>` : ""}
     <div class="tiles">
       ${impactTiles(r.business_impact || {})}
       ${root.node ? `<div class="tile wide"><b title="${esc(root.node)}">${esc(root.node)}</b><span>root · ${esc(root.status || "?")} · ${esc(seg(root.segment))}</span></div>` : ""}
@@ -523,7 +546,7 @@ function renderDetail() {
       <div class="card"><h4>Evidence</h4>${list(r.evidence)}</div>
       <div class="card"><h4>Still uncertain</h4>${list(r.uncertainty)}${r.ruled_out && r.ruled_out.length ? `<h4 style="margin-top:12px">Ruled out</h4>${list(r.ruled_out)}` : ""}</div>
     </div>
-    <div class="card" style="margin-top:12px"><h4>Investigation trail</h4>${r.trail && r.trail.length ? `<ol class="timeline">${r.trail.map((t, k) => `<li data-n="${k + 1}"><b>${esc(t.action.replace(/_/g, " "))}</b> <code>${esc(t.query)}</code><br>${esc(t.observation)}${t.reason ? `<br><span class="why">why: ${esc(t.reason)}</span>` : ""}</li>`).join("")}</ol>` : `<div class="muted">no investigation needed</div>`}</div>
+    <div class="card" style="margin-top:12px"><h4>Investigation trail${trailCount(r.trail)}</h4>${r.trail && r.trail.length ? `<ol class="timeline">${r.trail.map(trailStep).join("")}</ol>` : `<div class="muted">no investigation needed</div>`}</div>
     <div class="cols">
       <div class="card"><h4>Also affected (grouped here)</h4>${r.symptoms && r.symptoms.length ? `<ul>${r.symptoms.map((x) => `<li>${esc(x.metric)} ${esc(x.direction)} in ${esc(seg(x.segment))} <span class="muted">(${esc(x.rel_change_pct)}%)</span></li>`).join("")}</ul>` : `<div class="muted">none</div>`}</div>
       <div class="card"><h4>History</h4><ul>${(d.issue.history || []).map((h) => `<li><span class="num">${esc(when(h.time))}</span> ${esc(h.event)}${h.detail ? ": " + esc(h.detail) : ""}</li>`).join("")}</ul></div>

@@ -45,6 +45,18 @@ def _unexplained(state: InvestigationState) -> float:
     return max(0.05, 1.0 - max(0.0, min(1.0, float(state.explained_share))))
 
 
+def _uncaused(state: InvestigationState) -> float:
+    """Share of the change no driver accounts for yet.
+
+    Localizing the anomaly metric itself (``__self__``) says where the change
+    is, not why, so it does not make decomposing the metric worthless. Without
+    this, drilling down before decomposing (an order the model may choose)
+    would push every gain under ``min_gain`` and end the investigation early.
+    """
+    parts = sum(v for k, v in state.explained_parts.items() if k != "__self__")
+    return max(0.05, 1.0 - max(0.0, min(1.0, float(parts))))
+
+
 def _below(tree: dict[str, dict[str, Any]], metric: str) -> list[str]:
     """Metrics under ``metric`` in the contribution tree (breadth first)."""
     out, frontier = [], [metric]
@@ -104,7 +116,7 @@ def build_menu(
                         args,
                         f"Decompose {metric} via {f_str}",
                         1.0,
-                        unexplained * 0.70,
+                        max(unexplained, _uncaused(state)) * 0.70,
                     )
                 )
 
@@ -121,7 +133,7 @@ def build_menu(
         for tm in target_metrics:
             args = {"metric": tm, "segment": segment}
             if action_signature("drill_dimension", args) not in done:
-                base_gain = unexplained * (0.65 if tm == metric else 0.75)
+                base_gain = unexplained * 0.65 if tm == metric else max(unexplained, _uncaused(state)) * 0.75
                 gain = max(0.20, base_gain) if not any(h.get("localized") for h in state.hypotheses) else base_gain
                 raw_items.append(
                     (
@@ -182,7 +194,12 @@ def build_menu(
     if "check_events" in tools:
         args = {"metric": metric, "segment": segment, "lookback_hours": 2}
         if action_signature("check_events", args) not in done:
-            ev_gain = max(0.15, unexplained * 0.45) if not any(h.get("timing_aligned") for h in state.hypotheses) else unexplained * 0.45
+            # while a leading hypothesis still lacks timing evidence, checking events stays worth
+            # doing, however much of the change is already localized (where is not why)
+            timing_open = any("timing_aligned" in (h.get("missing_conditions") or [])
+                              for h in state.hypotheses[:3] if h.get("status") != "rejected")
+            no_timing = not any(h.get("timing_aligned") for h in state.hypotheses)
+            ev_gain = max(0.15, unexplained * 0.45) if (no_timing or timing_open) else unexplained * 0.45
             raw_items.append(
                 (
                     "check_events",
