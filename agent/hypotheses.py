@@ -108,8 +108,10 @@ def rank_hypotheses(hypotheses: list[Hypothesis]) -> list[Hypothesis]:
         ``       + 0.20 * (1.0 if mechanism_confirmed else 0.0)``
         ``       + 0.20 * clamp(confidence, 0, 1))``
         multiplied by ``0.5`` if ``is_symptom`` is True.
-    Ordering: ``confirmed`` > ``uncertain`` > ``rejected``, then descending
-    ``score``, then ascending ``(cause, node)``.
+    Ordering: possible first causes before symptoms; then ``confirmed`` >
+    ``uncertain`` > ``rejected``, then descending ``score``, then ascending
+    ``(cause, node)``. A confirmed symptom (cart adds fell) never outranks the
+    cause it is a symptom of (out-of-stock rate rose).
     """
     status_order = {"confirmed": 0, "uncertain": 1, "rejected": 2}
 
@@ -126,8 +128,19 @@ def rank_hypotheses(hypotheses: list[Hypothesis]) -> list[Hypothesis]:
 
     return sorted(
         hypotheses,
-        key=lambda h: (status_order[h.status], -round(_score(h), 6), h.cause, h.node),
+        key=lambda h: (h.status == "rejected", h.is_symptom, status_order[h.status], -round(_score(h), 6),
+                       h.cause, h.node),
     )
+
+
+def event_scope(ev: Any) -> dict[str, str]:
+    """The dimensions an event is limited to, e.g. {"country": "DE", "platform": "android"}."""
+    return {d: getattr(ev, d) for d in ("country", "platform", "category") if getattr(ev, d, None)}
+
+
+def scope_covers(scope: dict[str, str], segment: dict[str, str]) -> bool:
+    """True when an event with ``scope`` applies to the whole of ``segment``."""
+    return all(segment.get(d) == v for d, v in scope.items())
 
 
 def build_initial_hypotheses(
@@ -174,7 +187,8 @@ def build_initial_hypotheses(
                     source="event",
                     node=metric,
                     segment=dict(segment),
-                    evidence=[{"type": "event", "event_id": ev.event_id, "description": ev.description}],
+                    evidence=[{"type": "event", "event_id": ev.event_id, "description": ev.description,
+                               "scope": event_scope(ev)}],
                     confidence=0.65,
                     timing_aligned=True,
                 )

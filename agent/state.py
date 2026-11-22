@@ -24,6 +24,12 @@ class InvestigationState:
     stop_reason: str = ""
     completed_actions: list[str] = field(default_factory=list)
     active_formula_by_metric: dict[str, str] = field(default_factory=dict)
+    # contribution tree from decomposition: metric -> {share, parent, decomposed}
+    tree: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # how much of the anomaly each localized driver explains (driver share x localized share)
+    explained_parts: dict[str, float] = field(default_factory=dict)
+    # unplanned events found by check_events, with their scope
+    events_found: list[dict[str, Any]] = field(default_factory=list)
 
     def snapshot(self) -> InvestigationState:
         """Return a deep copy so callers cannot mutate shared state."""
@@ -65,6 +71,9 @@ class InvestigationState:
                 "stop_reason": self.stop_reason,
                 "completed_actions": list(self.completed_actions),
                 "active_formula_by_metric": dict(self.active_formula_by_metric),
+                "tree": dict(self.tree),
+                "explained_parts": dict(self.explained_parts),
+                "events_found": list(self.events_found),
             }
         )
 

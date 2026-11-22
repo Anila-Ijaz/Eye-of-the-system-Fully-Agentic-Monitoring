@@ -32,7 +32,7 @@ in the evaluation period can't widen its own range.
 from __future__ import annotations
 
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Optional, Sequence
 
 import numpy as np
@@ -103,6 +103,7 @@ class Baseline:
     coverage: np.ndarray  # rows present / rows normally present
     train_end: pd.Timestamp
     config: BaselineConfig = field(default_factory=BaselineConfig)
+    fit: Optional[dict] = None  # what was learned from training data (reusable)
 
     def z(self) -> np.ndarray:
         s = self.series
@@ -219,12 +220,18 @@ def window_values(s: SegmentSeries, hours: int) -> np.ndarray:
     return pd.DataFrame(s.values).rolling(hours, min_periods=hours).mean().to_numpy()
 
 
-def window_coverage(s: SegmentSeries, hours: int, train_mask: np.ndarray) -> np.ndarray:
-    """Data rows in the window divided by the rows normally there."""
+def typical_rows(s: SegmentSeries, train_mask: np.ndarray) -> np.ndarray:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
         typical = np.nanmedian(np.where(train_mask[:, None] & (s.rows > 0), s.rows, np.nan), axis=0)
-    typical = np.where(np.isfinite(typical) & (typical > 0), typical, 1.0)
+    return np.where(np.isfinite(typical) & (typical > 0), typical, 1.0)
+
+
+def window_coverage(s: SegmentSeries, hours: int, train_mask: np.ndarray,
+                    typical: Optional[np.ndarray] = None) -> np.ndarray:
+    """Data rows in the window divided by the rows normally there."""
+    if typical is None:
+        typical = typical_rows(s, train_mask)
     have = pd.DataFrame(s.rows).rolling(hours, min_periods=1).sum().to_numpy()
     return have / (typical * hours)
 
@@ -266,12 +273,31 @@ def build_baseline(
     window_hours: int,
     train_end: Any,
     config: Optional[BaselineConfig] = None,
+    fit: Optional[dict] = None,
 ) -> Baseline:
+    """Baseline for every hour of ``s``.
+
+    ``fit`` (from a previous ``Baseline.fit`` with the same ``train_end``)
+    skips re-learning growth, bias, sigma and typical row counts from the
+    training data. The live detector passes it, with a short trailing slice
+    of the series, so a tick costs milliseconds.
+    """
     cfg = config or BaselineConfig()
     train_end = _ts(train_end)
     train = np.asarray(s.index < train_end)
     A = window_values(s, window_hours)
     y = s.to_scale(A)
+    if fit is not None:
+        g, bias, sigma_seg = fit["g"], fit["bias"], fit["sigma_seg"]
+        stack = np.stack([_shift(y, k * HOURS_PER_WEEK) + k * g for k in range(1, cfg.history_weeks + 1)])
+        weeks = np.isfinite(stack).sum(axis=0)
+        yE = np.where(weeks >= cfg.min_history_weeks, _nanmedian(stack, axis=0), np.nan)
+        expected = s.from_scale(yE + bias)
+        sigma = np.maximum(sigma_seg[None, :], count_noise(s, window_hours, expected))
+        if s.scale == "linear":
+            sigma = np.where(sigma > 0, sigma, np.nan)
+        return Baseline(s, window_hours, A, expected, sigma, np.exp(g), bias, weeks,
+                        window_coverage(s, window_hours, train, fit["typical"]), train_end, cfg, fit)
 
     # weekly growth per segment, from 24h windows in the training period
     # (log scale only: absolute-scale rates have no multiplicative trend)
@@ -318,7 +344,74 @@ def build_baseline(
         coverage=window_coverage(s, window_hours, train),
         train_end=train_end,
         config=cfg,
+        fit={"g": g, "bias": bias, "sigma_seg": sigma_seg, "typical": typical_rows(s, train)},
     )
+
+
+def score_positions(s: SegmentSeries, window_hours: int, fit: dict, positions: np.ndarray,
+                    config: Optional[BaselineConfig] = None) -> dict[str, np.ndarray]:
+    """Actual, expected, sigma, coverage and weeks at a few hour positions only.
+
+    The same formulas as ``build_baseline`` with a ``fit``, evaluated at
+    ``positions`` (row indices of ``s``) instead of every hour: the window
+    value at t and at t - 1..K weeks. Used by the live detector; a test checks
+    it gives the same numbers as ``build_baseline``.
+    """
+    cfg = config or BaselineConfig()
+    w = window_hours
+    T = len(s.index)
+
+    def window_at(pos: np.ndarray, vals: np.ndarray, kind: str, wts: Optional[np.ndarray]) -> np.ndarray:
+        out = np.full((len(pos), vals.shape[1]), np.nan)
+        for i, p in enumerate(pos):
+            if p - w + 1 < 0 or p >= T:
+                continue
+            block = vals[p - w + 1:p + 1]
+            if kind == "sum":
+                out[i] = block.sum(axis=0) if w > 1 else block[0]
+                if w > 1:
+                    out[i] = np.where(np.isnan(block).any(axis=0), np.nan, out[i])
+            elif kind == "weighted":
+                wb = wts[p - w + 1:p + 1]
+                num, den = (block * wb).sum(axis=0), wb.sum(axis=0)
+                bad = np.isnan(block).any(axis=0) | np.isnan(wb).any(axis=0)
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    out[i] = np.where(bad | (den <= 0), np.nan, num / den) if w > 1 else block[0]
+            else:
+                out[i] = block.mean(axis=0) if w > 1 else block[0]
+                if w > 1:
+                    out[i] = np.where(np.isnan(block).any(axis=0), np.nan, out[i])
+        return out
+
+    A = window_at(positions, s.values, s.kind, s.weights)
+    shifted = np.stack([s.to_scale(window_at(positions - k * HOURS_PER_WEEK, s.values, s.kind, s.weights))
+                        + k * fit["g"] for k in range(1, cfg.history_weeks + 1)])
+    weeks = np.isfinite(shifted).sum(axis=0)
+    yE = np.where(weeks >= cfg.min_history_weeks, _nanmedian(shifted, axis=0), np.nan)
+    expected = s.from_scale(yE + fit["bias"])
+    # count noise needs the window's denominator / expected count at these positions
+    if s.kind == "weighted":
+        n = window_at(positions, s.weights, "sum", None)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            p_ = np.maximum(expected, 0.0)
+            spread = np.maximum(1.0 - p_, 0.0) if s.unit == "ratio" else 1.0
+            sd = np.sqrt(p_ * spread / np.maximum(n, 1.0))
+    elif s.kind == "sum" and s.unit == "count" and not s.completeness:
+        sd = np.sqrt(np.maximum(expected, 0.0))
+    else:
+        sd = np.zeros_like(expected)
+    if s.completeness:
+        sd = np.zeros_like(expected)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        if s.scale == "log":
+            sd = sd / (np.abs(expected) + s.log_offset)
+    sd = np.where(np.isfinite(sd), sd, 0.0)
+    sigma = np.maximum(fit["sigma_seg"][None, :], sd)
+    if s.scale == "linear":
+        sigma = np.where(sigma > 0, sigma, np.nan)
+    have = np.stack([s.rows[max(0, p - w + 1):p + 1].sum(axis=0) for p in positions])
+    coverage = have / (fit["typical"] * w)
+    return {"actual": A, "expected": expected, "sigma": sigma, "coverage": coverage, "weeks": weeks}
 
 
 def _ts(t: Any) -> pd.Timestamp:

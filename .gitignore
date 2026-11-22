@@ -7,5 +7,6 @@ venv/
 .vscode/
 *.log
 data/generated/
+data/llm_cache/
 .DS_Store
 Thumbs.db

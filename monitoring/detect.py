@@ -128,61 +128,89 @@ class Detector:
         end_ts = _ts(end) if end is not None else hi + pd.Timedelta(hours=1)
         train_end = _ts(train_end) if train_end is not None else start_ts
         series = load_series(self.engine, metric, by, segment, None, end_ts, config=cfg.baseline)
+        return self.score_series(series, start_ts, end_ts, train_end, windows)
+
+    def score_series(self, series, start_ts, end_ts, train_end, windows=None, fits=None) -> pd.DataFrame:
+        """Score an already loaded ``SegmentSeries`` (used by the live detector).
+
+        ``fits`` (window -> ``Baseline.fit``) is filled on first use and reused
+        afterwards, so the training data is only learned from once.
+        """
+        cfg = self.config
+        metric = series.metric
         defn = self.engine.registry.get(metric)
+        idx = series.index
+        keep = np.asarray((idx >= start_ts) & (idx < end_ts))
+        n_keep, n_seg = int(keep.sum()), series.values.shape[1]
+        seg_cols = {d: np.repeat([str(series.segments.iloc[j][d]) for j in range(n_seg)], n_keep)
+                    for d in series.by}
+
+        def col(a):  # segment-major: all kept hours of segment 0, then segment 1, ...
+            return np.asarray(a)[keep].T.reshape(-1)
 
         frames = []
         for w in windows or cfg.windows:
-            b = build_baseline(series, w, train_end, cfg.baseline)
+            fit = fits.get(w) if fits is not None else None
+            b = build_baseline(series, w, train_end, cfg.baseline, fit=fit)
+            if fits is not None and fit is None:
+                fits[w] = b.fit
             z = b.z()
             lower, upper = b.band(cfg.z_threshold)
-            idx = series.index
-            keep = np.asarray((idx >= start_ts) & (idx < end_ts))
-            for j in range(series.values.shape[1]):
-                a, e = b.actual[keep, j], b.expected[keep, j]
-                with np.errstate(divide="ignore", invalid="ignore"):
-                    rel = a / e - 1
-                f = pd.DataFrame({
-                    "metric": metric,
-                    "window_hours": w,
-                    "window_end": idx[keep] + pd.Timedelta(hours=1),
-                    "actual": a,
-                    "expected": e,
-                    "lower": lower[keep, j],
-                    "upper": upper[keep, j],
-                    "abs_change": a - e,
-                    "rel_change": rel,
-                    "z": z[keep, j],
-                    "sigma": b.sigma[keep, j],
-                    "coverage": b.coverage[keep, j],
-                    "weeks_used": b.weeks_used[keep, j],
-                })
-                for d, v in series.segment_dict(j).items():
-                    f[d] = v
-                frames.append(f)
+            a, e = col(b.actual), col(b.expected)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                rel = a / e - 1
+            frames.append(pd.DataFrame({
+                "metric": metric,
+                "window_hours": w,
+                "window_end": np.tile(idx[keep] + pd.Timedelta(hours=1), n_seg),
+                "actual": a,
+                "expected": e,
+                "lower": col(lower),
+                "upper": col(upper),
+                "abs_change": a - e,
+                "rel_change": rel,
+                "z": col(z),
+                "sigma": col(b.sigma),
+                "coverage": col(b.coverage),
+                "weeks_used": col(b.weeks_used),
+                **seg_cols,
+            }))
         out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        if not out.empty:
+            out["window_end"] = pd.to_datetime(out["window_end"], utc=True)
         if out.empty:
             return out
+        return self.decide(out, series.by, series.completeness, defn.higher_is_better)
+
+    def decide(self, out: pd.DataFrame, by: Sequence[str], completeness, higher_is_better) -> pd.DataFrame:
+        """Apply the anomaly rules to scored cells (rows ordered by segment, then hour).
+
+        ``completeness`` and ``higher_is_better`` are one value for the whole
+        frame, or one per row (the live detector decides all series at once,
+        grouping by a combined key in ``by``). Extra columns are kept.
+        """
+        cfg = self.config
         out["window_start"] = out["window_end"] - pd.to_timedelta(out["window_hours"], unit="h")
         out["direction"] = np.where(out["z"] >= 0, "up", "down")
-        out["impact"] = [_impact(defn.higher_is_better, d) for d in out["direction"]]
+        out["impact"] = _impact_vec(higher_is_better, out["direction"].to_numpy())
         scored = np.isfinite(out["z"]) & (out["weeks_used"] >= cfg.baseline.min_history_weeks)
         big = scored & (out["z"].abs() >= cfg.z_threshold) & (out["rel_change"].abs() >= cfg.min_rel_change)
         # 1h windows: a single hour must be extreme; otherwise its neighbour must agree
-        seg_keys = ["window_hours", *series.by]
+        seg_keys = ["window_hours", *by]
         same_dir = out["direction"]
         prev_big = big.groupby([out[k] for k in seg_keys]).shift(1, fill_value=False) &             (same_dir.groupby([out[k] for k in seg_keys]).shift(1) == same_dir)
         next_big = big.groupby([out[k] for k in seg_keys]).shift(-1, fill_value=False) &             (same_dir.groupby([out[k] for k in seg_keys]).shift(-1) == same_dir)
         strong = out["z"].abs() >= 2 * cfg.z_threshold
         persistent = (out["window_hours"] > 1) | prev_big | next_big | strong
-        incomplete = (out["coverage"] < cfg.min_coverage) & (not series.completeness)
+        incomplete = (out["coverage"] < cfg.min_coverage) & ~np.asarray(completeness, dtype=bool)
         out["is_anomaly"] = big & persistent & ~incomplete
         out["suppressed"] = np.where(big & incomplete, "incomplete data",
                                      np.where(big & ~persistent, "single hour", ""))
         out.loc[~np.isfinite(out["actual"]), "suppressed"] = "missing data"
-        cols = ["metric", *series.by, "window_hours", "window_start", "window_end", "actual", "expected",
+        cols = ["metric", *by, "window_hours", "window_start", "window_end", "actual", "expected",
                 "lower", "upper", "abs_change", "rel_change", "z", "sigma", "direction", "impact",
                 "coverage", "weeks_used", "is_anomaly", "suppressed"]
-        return out[cols]
+        return out[cols + [c for c in out.columns if c not in cols]]
 
     # --- anomalies grouped into episodes -------------------------------------
     def detect(
@@ -278,6 +306,14 @@ def _combine(cluster: list[Episode]) -> Episode:
         "ongoing": any(e.ongoing for e in short),
         "windows": sorted({w for e in cluster for w in (e.windows or [e.window_hours])}),
     })
+
+
+def _impact_vec(higher_is_better, direction: np.ndarray) -> np.ndarray:
+    """``_impact`` for many rows; ``higher_is_better`` is one value or one per row."""
+    hib = np.broadcast_to(np.asarray(higher_is_better, dtype=object), direction.shape)
+    up = direction == "up"
+    good = np.array([h is not None and (u == bool(h)) for h, u in zip(hib, up)])
+    return np.where(np.array([h is None for h in hib]), "neutral", np.where(good, "good", "bad"))
 
 
 def _impact(higher_is_better, direction: str) -> str:

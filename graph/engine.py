@@ -74,6 +74,25 @@ class MetricEngine:
         self._columns[name] = list(data.columns)
         self._group_cache = {k: v for k, v in self._group_cache.items() if k[0] != name}
 
+    def append_rows(self, name: str, df: pd.DataFrame) -> None:
+        """Add rows to a registered table (live data); columns must match it."""
+        if name not in self._columns:
+            self.register_table(name, df)
+            return
+        if df.empty:
+            return
+        data = df.copy()
+        data[_TIME_COLUMN] = pd.to_datetime(data[_TIME_COLUMN], utc=True).dt.tz_localize(None)
+        missing = [c for c in self._columns[name] if c not in data.columns]
+        if missing:
+            raise ValueError(f"rows for {name!r} are missing columns {missing}")
+        data = data[self._columns[name]]
+        self._con.register("__append", data)
+        cols = ", ".join(f'"{c}"' for c in self._columns[name])
+        self._con.execute(f'INSERT INTO "{name}" ({cols}) SELECT {cols} FROM "__append"')
+        self._con.unregister("__append")
+        self._group_cache = {k: v for k, v in self._group_cache.items() if k[0] != name}
+
     def tables(self) -> list[str]:
         return list(self._columns)
 
@@ -84,7 +103,7 @@ class MetricEngine:
 
     def time_range(self, table: str = "marketplace_hourly") -> tuple[pd.Timestamp, pd.Timestamp]:
         """(first timestamp, last timestamp) present in the table, UTC."""
-        lo, hi = self._con.execute(f'SELECT MIN("{_TIME_COLUMN}"), MAX("{_TIME_COLUMN}") FROM "{table}"').fetchone()
+        lo, hi = self._con.execute(f'SELECT MIN("{_TIME_COLUMN}"), MAX("{_TIME_COLUMN}") FROM "{table}"').fetchall()[0]
         return _utc(lo), _utc(hi)
 
     def dimension_values(self, dimension: str, table: str = "marketplace_hourly") -> list[str]:
