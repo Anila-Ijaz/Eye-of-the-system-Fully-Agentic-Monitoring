@@ -8,19 +8,78 @@ uncertain. No person asks it questions or guides an investigation.
 
 Built for the Almedia track "Eye of the System: Fully Agentic Monitoring".
 
-## Run the demo
+## Quick start
+
+Tested with Python 3.13.
+
+**1. Get the code and install**
 
 ```bash
+git clone https://github.com/Anila-Ijaz/Eye-of-the-system-Fully-Agentic-Monitoring.git
+cd Eye-of-the-system-Fully-Agentic-Monitoring
+python -m venv .venv
+.venv\Scripts\activate          # Windows
+# source .venv/bin/activate     # macOS / Linux
 pip install -r requirements.txt
-python -m demo              # live dashboard, opens http://127.0.0.1:8050
-python -m demo --headless   # the same run in the terminal, then a scorecard
 ```
 
-The demo builds 4 weeks of marketplace history, then streams 6 simulated days,
-about one simulated hour per second. A scripted timeline injects faults and
-innocent changes while it runs, and adds a new metric halfway. The monitor
-isn't told any of this. On the dashboard you can also inject any scenario or
-add a metric yourself, and pause, step or change the speed.
+**2. Start the demo dashboard**
+
+```bash
+python -m demo
+```
+
+A browser tab opens at **http://127.0.0.1:8050**. If it doesn't, open that
+address yourself. No API key is needed: without one, the system uses its
+rule-based chooser and template report text.
+
+The demo first builds 4 weeks of marketplace history, which takes a moment.
+Then it streams 6 simulated days, one hour per tick. A scripted timeline
+injects faults and innocent changes, and adds a new metric halfway. The
+monitor isn't told any of this. When the 6 days are done, the run stops and
+everything is saved to `data/generated/demo_run/`.
+
+**3. Or run it in the terminal only**
+
+```bash
+python -m demo --headless           # prints alerts as they happen, then the scorecard
+python -m demo --headless --quiet   # only alerts and the scorecard
+```
+
+The full 6-day run takes about 7 minutes without the model (about 2.7 s per
+simulated hour), and about 15 minutes with the model (about 6 s per hour).
+
+**4. Run the tests**
+
+```bash
+python -m pytest        # 210 tests, about 6 minutes; no API key or network needed
+```
+
+## Using the dashboard
+
+| Area | What it shows |
+|---|---|
+| Top bar | Simulated clock; **Pause / Resume**, **Step 1h**, speed (Fastest, 1, 2 or 4 s per hour); light/dark toggle; "model-chosen steps: X of Y" when the model is on |
+| Left: **Issues** | Every issue the monitor opened, with status (open, resolved) and severity. Click one to see its report |
+| Middle, **Issue report** tab | Headline (confirmed or most likely), business impact, evidence, what is still uncertain, recommended actions, and the investigation trail. Each step shows whether the model or the rules chose it, and why |
+| Middle, **Metric graph** tab | The metrics and the formula and cause links between them, with their status. A new metric appears here once the system has placed it |
+| Middle, **What it watches** tab | The current watch list and why each metric is on it |
+| Middle, **Scorecard** tab | The hidden ground truth compared with what the monitor reported. This is the only part that reads the ground truth |
+| Right: **Agent decisions** | Live feed: data checks, anomalies, triage decisions, new issues, investigations, alerts |
+| Inject buttons | **Inject fault**, **Innocent change** and **New metric** start a scenario now. Use them with `--manual`, or on top of the scripted run |
+
+What to look for in the scripted run (the live period starts 29 Oct 00:00 UTC):
+
+| Clock (UTC) | What to look at |
+|---|---|
+| 29 Oct 04:00 | Payment issue in DE/Android: **confirmed**, release named as the trigger |
+| 29 Oct 12:00 onwards | UK promo changes in the feed: "explained by planned event … not an incident" |
+| 30 Oct 07:00–13:00 | "Data incomplete" issue for DE/iOS, closed when the late rows arrive |
+| 30 Oct 12:00 | Feed line `new metric orders_per_search`; the new node in **Metric graph** |
+| 31 Oct 04:00 | Stock-out in electronics: **most likely**, with what is missing |
+| 1 Nov 05:00 | Search release in DE: **confirmed** |
+| 2 Nov 05:00 | Ad budget in FR: **most likely** |
+| End | **Scorecard** tab |
 
 | Time | What happens (hidden from the monitor) |
 |---|---|
@@ -32,8 +91,15 @@ add a metric yourself, and pause, step or change the speed.
 | +76 h | a search release breaks German search results |
 | +100 h | ad budget spent too fast in France; public holiday in the US |
 
-Other options: `--manual` (no script; inject from the page), `--days N`,
-`--speed 1` (a second per hour), `--llm` (see below), `--out DIR`.
+Other options:
+- `--manual`: no scripted timeline; inject from the page.
+- `--days N`: number of simulated live days.
+- `--speed 1`: an extra second between hours.
+- `--port 8060`: use another port if 8050 is taken.
+- `--no-browser`: don't open a browser tab.
+- `--no-llm`: rules only, even when a key is set.
+- `--llm-cache-mode record|replay`: see "Run it with Claude" below.
+- `--out DIR`: where reports and the scorecard go.
 
 ### What the system reports (6-day run, seed 42)
 
@@ -49,9 +115,9 @@ Other options: `--manual` (no script; inject from the page), `--days N`,
 
 That is 10 alerts in 6 days: one when each problem was opened, one when it
 was resolved, and one when the stock-out's root cause sharpened. Hundreds of
-anomalous signals were grouped into those issues. The run takes about
-1 second per simulated hour. Reports, alerts, the feed and the scorecard are
-saved to `data/generated/demo_run/`.
+anomalous signals were grouped into those issues. Reports, alerts, the feed
+and the scorecard are saved to `data/generated/demo_run/`. The run with Claude
+choosing the steps gave the same scorecard.
 
 ## How it works
 
@@ -85,19 +151,39 @@ Every simulated hour the runner ([runtime/runner.py](runtime/runner.py)) does th
 Only the scorecard reads the simulator's ground truth. The monitor sees rows,
 the event calendar (release log, planned campaigns) and the metric graph.
 
-### The model at the decision points (Claude)
+### Run it with Claude
 
-When `ANTHROPIC_API_KEY` and `LLM_MODEL` are set, Claude is the primary
-chooser of investigation steps and writes the report summaries. No flag is
-needed; `--no-llm` turns it off. Keys and model ids come only from the
-environment. Never commit them.
+When `ANTHROPIC_API_KEY` and `LLM_MODEL` are set, Claude chooses the
+investigation steps and writes the report summaries. No flag is needed;
+`--no-llm` turns it off. Keys and model ids come only from the environment.
+Never commit them.
 
-```bash
-export ANTHROPIC_API_KEY=...          # read by the anthropic SDK; never printed or logged
-export LLM_MODEL=claude-opus-5-5      # chooses the next step
-export LLM_REPORT_MODEL=...           # writes report text (optional, default LLM_MODEL)
-python -m demo --headless
-```
+1. Copy the example settings and fill in your key and model:
+   ```bash
+   cp .env.example .env        # Windows: copy .env.example .env
+   ```
+   ```ini
+   ANTHROPIC_API_KEY=your-key  # read by the anthropic SDK; never printed or logged
+   LLM_MODEL=...               # chooses the next step
+   LLM_REPORT_MODEL=...        # writes report text (optional, default LLM_MODEL)
+   ```
+   `.env` is git-ignored. The demo and the scripts read it on start. A
+   variable already set in your shell takes precedence.
+2. Record one run. This calls the API (about 200 calls for the 6 days) and
+   saves every answer to `data/llm_cache/`:
+   ```bash
+   python -m demo --llm-cache-mode record
+   ```
+3. Replay it as often as you like: the same run, no API calls, no cost:
+   ```bash
+   python -m demo --llm-cache-mode replay
+   ```
+   Replay needs only `LLM_MODEL`, not the key. Don't use the inject or
+   add-metric buttons during record or replay: an action that wasn't
+   recorded has no saved answers, and those steps fall back to the rules.
+
+`data/llm_cache/` is git-ignored, so a fresh clone has no recording to
+replay. Record once first.
 
 | The model decides | Code decides |
 |---|---|
